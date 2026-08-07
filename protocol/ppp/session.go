@@ -91,6 +91,7 @@ type Session struct {
 	ipcpRequestData []byte
 	authChallenge   [16]byte
 	authIdentifier  uint8
+	lcpIdentifier   uint8
 }
 
 func (s *Session) Authentication() AuthenticationMethod { return s.config.Authentication }
@@ -130,7 +131,8 @@ func (s *Session) Start() ([]Frame, error) {
 	}
 	data, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}}, Option{Type: 3, Value: authValue})
 	s.lcpRequest = append([]byte(nil), data...)
-	return controlFrames(ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 1, Data: data})
+	s.lcpIdentifier = 1
+	return controlFrames(ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: s.lcpIdentifier, Data: data})
 }
 
 func (s *Session) Handle(frame Frame) (SessionResult, error) {
@@ -161,8 +163,23 @@ func (s *Session) Handle(frame Frame) (SessionResult, error) {
 		}
 		return SessionResult{IPv4: append([]byte(nil), frame.Payload...)}, nil
 	default:
-		return SessionResult{}, fmt.Errorf("%w: %#x", ErrUnexpectedProtocol, frame.Protocol)
+		if s.Phase == PhaseClosed {
+			return SessionResult{}, fmt.Errorf("%w: %#x", ErrUnexpectedProtocol, frame.Protocol)
+		}
+		return s.rejectProtocol(frame)
 	}
+}
+
+func (s *Session) rejectProtocol(frame Frame) (SessionResult, error) {
+	s.lcpIdentifier++
+	data := make([]byte, 2, 2+len(frame.Payload))
+	binary.BigEndian.PutUint16(data, frame.Protocol)
+	data = append(data, frame.Payload...)
+	frames, err := controlFrames(ProtocolLCP, ControlPacket{Code: ProtocolReject, Identifier: s.lcpIdentifier, Data: data})
+	if err != nil {
+		return SessionResult{}, err
+	}
+	return SessionResult{Frames: frames}, nil
 }
 
 func (s *Session) handleLCP(payload []byte) (SessionResult, error) {
@@ -226,7 +243,7 @@ func (s *Session) handleLCP(payload []byte) (SessionResult, error) {
 	// Windows can send Identification packets and one final LCP request after
 	// acknowledging our options. Repeat the active challenge after accepting
 	// that request so authentication is not lost during the handoff.
-	if packet.Code == ConfigureRequest && s.Phase == PhaseAuthenticate && s.config.Authentication == AuthenticationMSCHAPv2 {
+	if packet.Code == ConfigureRequest && phaseBefore == PhaseAuthenticate && s.config.Authentication == AuthenticationMSCHAPv2 {
 		challenge, err := s.currentMSCHAPv2Challenge()
 		if err != nil {
 			return SessionResult{}, err

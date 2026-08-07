@@ -30,6 +30,8 @@ func (c Code) String() string {
 		return "Terminate-Request"
 	case TerminateAck:
 		return "Terminate-Ack"
+	case ProtocolReject:
+		return "Protocol-Reject"
 	case EchoRequest:
 		return "Echo-Request"
 	case EchoReply:
@@ -46,6 +48,7 @@ const (
 	ConfigureReject  Code = 4
 	TerminateRequest Code = 5
 	TerminateAck     Code = 6
+	ProtocolReject   Code = 8
 	EchoRequest      Code = 9
 	EchoReply        Code = 10
 )
