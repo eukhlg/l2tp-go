@@ -47,13 +47,16 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 	buffer := make([]byte, 65535)
 	for {
+		if ctx.Err() != nil {
+			return s.gracefulShutdown(ctx)
+		}
 		if err := s.Conn.SetReadDeadline(time.Now().Add(tick)); err != nil {
 			return err
 		}
 		n, peer, err := s.Conn.ReadFrom(buffer)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return s.gracefulShutdown(ctx)
 			}
 			var netErr net.Error
 			if !errors.As(err, &netErr) || !netErr.Timeout() {
@@ -120,6 +123,25 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (s *Server) gracefulShutdown(ctx context.Context) error {
+	packets, closed, err := s.Engine.Shutdown()
+	if err != nil {
+		return err
+	}
+	for _, packet := range packets {
+		if _, err := s.Conn.WriteTo(packet.Payload, packet.Peer); err != nil {
+			return err
+		}
+		s.Engine.debugf("udp tx shutdown peer=%s bytes=%d", packet.Peer, len(packet.Payload))
+	}
+	if s.SessionClosed != nil {
+		for _, info := range closed {
+			s.SessionClosed(ctx, info)
+		}
+	}
+	return nil
 }
 
 func (s *Server) Close() error {

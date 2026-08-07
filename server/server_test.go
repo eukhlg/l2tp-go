@@ -47,6 +47,17 @@ func TestServerLoopbackHandshake(t *testing.T) {
 		t.Fatalf("message=%#v err=%v", message, err)
 	}
 	cancel()
+	if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	n, err = client.Read(buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err = channel.Receive(buffer[:n])
+	if err != nil || message == nil || message.Type != l2tp.StopCCN {
+		t.Fatalf("shutdown message=%#v err=%v", message, err)
+	}
 	select {
 	case err := <-done:
 		if err != nil {

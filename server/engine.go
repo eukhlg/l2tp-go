@@ -115,7 +115,7 @@ func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Resu
 }
 
 func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, now time.Time) (Result, error) {
-	runtime, created, err := e.findControlTunnel(peer, packet, wire)
+	runtime, created, replaced, err := e.findControlTunnel(peer, packet, wire)
 	if err != nil {
 		return Result{}, err
 	}
@@ -130,14 +130,14 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 	if message == nil {
 		if len(packet.AVPs) == 0 {
 			e.debugf("control zlb peer=%s tunnel=%d nr=%d", peer, runtime.state.LocalTunnelID, packet.Nr)
-			return Result{}, nil // ZLBs acknowledge; they are never acknowledged.
+			return Result{Closed: replaced}, nil // ZLBs acknowledge; they are never acknowledged.
 		}
 		ack, err := runtime.channel.Ack()
 		if err != nil {
 			return Result{}, err
 		}
 		e.debugf("control duplicate peer=%s tunnel=%d ns=%d", peer, runtime.state.LocalTunnelID, packet.Ns)
-		return Result{Replies: [][]byte{ack}}, nil
+		return Result{Replies: [][]byte{ack}, Closed: replaced}, nil
 	}
 	stateBefore := runtime.state.State
 	e.debugf("control message peer=%s type=%s tunnel=%d session=%d state=%s", peer, message.Type, message.TunnelID, message.SessionID, stateBefore)
@@ -167,9 +167,9 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 			return Result{}, err
 		}
 		e.debugf("control tx peer=%s type=%s local_tunnel=%d peer_tunnel=%d session=%d state=%s->%s bytes=%d", peer, reply.Type, runtime.state.LocalTunnelID, runtime.state.PeerTunnelID, reply.SessionID, stateBefore, runtime.state.State, len(wire))
-		return Result{Replies: [][]byte{wire}}, nil
+		return Result{Replies: [][]byte{wire}, Closed: replaced}, nil
 	}
-	result := Result{}
+	result := Result{Closed: replaced}
 	if removedSessionID != 0 {
 		if closed := e.releaseSession(runtime, removedSessionID); closed != nil {
 			result.Closed = append(result.Closed, *closed)
@@ -261,51 +261,64 @@ func (e *Engine) queueCallRejection(runtime *tunnelRuntime, peerSessionID uint16
 	return Result{Replies: [][]byte{wire}}, nil
 }
 
-func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byte) (*tunnelRuntime, bool, error) {
+func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byte) (*tunnelRuntime, bool, []SessionInfo, error) {
 	if packet.TunnelID != 0 {
 		runtime, ok := e.tunnels[packet.TunnelID]
 		if !ok {
-			return nil, false, ErrUnknownTunnel
+			return nil, false, nil, ErrUnknownTunnel
 		}
 		if peerKey(runtime.peer) != peerKey(peer) {
-			return nil, false, ErrPeerAddress
+			return nil, false, nil, ErrPeerAddress
 		}
-		return runtime, false, nil
-	}
-	if id, ok := e.tunnelByPeer[peerKey(peer)]; ok {
-		return e.tunnels[id], false, nil
+		return runtime, false, nil, nil
 	}
 	message, err := l2tp.DecodeControlMessage(wire)
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	if message.Type != l2tp.SCCRQ {
-		return nil, false, ErrUnknownTunnel
+		return nil, false, nil, ErrUnknownTunnel
+	}
+	if message.Ns != 0 || message.Nr != 0 {
+		return nil, false, nil, fmt.Errorf("%w: fresh SCCRQ requires Ns=0 and Nr=0", l2tp.ErrUnexpectedMessage)
 	}
 	assigned, ok := message.Find(l2tp.AttrAssignedTunnelID)
 	if !ok {
-		return nil, false, fmt.Errorf("%w: assigned tunnel ID", l2tp.ErrMissingAttribute)
+		return nil, false, nil, fmt.Errorf("%w: assigned tunnel ID", l2tp.ErrMissingAttribute)
 	}
 	peerID, err := assigned.Uint16()
 	if err != nil {
-		return nil, false, err
+		return nil, false, nil, err
 	}
 	peerWindow := uint16(1)
 	if windowAVP, ok := message.Find(l2tp.AttrReceiveWindowSize); ok {
 		peerWindow, err = windowAVP.Uint16()
 		if err != nil {
-			return nil, false, err
+			return nil, false, nil, err
 		}
 		if peerWindow == 0 {
-			return nil, false, fmt.Errorf("%w: zero receive window", l2tp.ErrInvalidAttribute)
+			return nil, false, nil, fmt.Errorf("%w: zero receive window", l2tp.ErrInvalidAttribute)
 		}
+	}
+	probe := l2tp.NewServerTunnel(l2tp.ServerTunnelConfig{LocalTunnelID: 1, HostName: e.config.HostName, VendorName: e.config.VendorName, ReceiveWindow: e.config.ReceiveWindow})
+	if _, err := probe.Handle(message); err != nil {
+		return nil, false, nil, err
+	}
+	var replaced []SessionInfo
+	if id, ok := e.tunnelByPeer[peerKey(peer)]; ok {
+		runtime := e.tunnels[id]
+		if runtime != nil && runtime.state.State != l2tp.TunnelEstablished && runtime.state.PeerTunnelID == peerID {
+			return runtime, false, nil, nil
+		}
+		e.debugf("control restart peer=%s replacing_tunnel=%d", peer, id)
+		replaced = e.removeTunnel(id)
 	}
 	localID := e.allocateTunnelID()
 	state := l2tp.NewServerTunnel(l2tp.ServerTunnelConfig{LocalTunnelID: localID, FirstSessionID: e.config.FirstSessionID, HostName: e.config.HostName, VendorName: e.config.VendorName, ReceiveWindow: e.config.ReceiveWindow})
 	runtime := &tunnelRuntime{peer: peer, state: state, channel: l2tp.NewControlChannel(peerID, peerWindow), sessions: make(map[uint16]*sessionRuntime)}
 	e.tunnels[localID] = runtime
 	e.tunnelByPeer[peerKey(peer)] = localID
-	return runtime, true, nil
+	return runtime, true, replaced, nil
 }
 
 func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
@@ -416,6 +429,30 @@ func (e *Engine) Retransmit(now time.Time, timeout time.Duration, maxRetries int
 		}
 	}
 	return result, nil
+}
+
+// Shutdown creates a final StopCCN for every live tunnel and releases all
+// local session resources. The packets are intentionally not retained for
+// retransmission because the process is terminating.
+func (e *Engine) Shutdown() ([]Datagram, []SessionInfo, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var packets []Datagram
+	var closed []SessionInfo
+	for id, runtime := range e.tunnels {
+		message := l2tp.ControlMessage{Type: l2tp.StopCCN, AVPs: []l2tp.AVP{
+			l2tp.Uint16AVP(l2tp.AttrAssignedTunnelID, runtime.state.LocalTunnelID, true),
+			l2tp.Uint16AVP(l2tp.AttrResultCode, 6, true),
+		}}
+		wire, err := runtime.channel.QueueUntracked(message)
+		if err != nil {
+			return packets, closed, err
+		}
+		packets = append(packets, Datagram{Payload: wire, Peer: runtime.peer})
+		closed = append(closed, e.removeTunnel(id)...)
+		e.debugf("tunnel shutdown peer=%s tunnel=%d", runtime.peer, id)
+	}
+	return packets, closed, nil
 }
 
 func (e *Engine) TunnelCount() int { e.mu.Lock(); defer e.mu.Unlock(); return len(e.tunnels) }

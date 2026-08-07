@@ -54,6 +54,20 @@ func (c *ControlChannel) Queue(message ControlMessage, now time.Time) ([]byte, e
 	return append([]byte(nil), wire...), nil
 }
 
+// QueueUntracked encodes one sequenced control message without retaining it
+// for retransmission or applying the peer's transmit-window limit. It is
+// intended for a final StopCCN sent while the local process is shutting down.
+func (c *ControlChannel) QueueUntracked(message ControlMessage) ([]byte, error) {
+	message.TunnelID = c.PeerTunnelID
+	message.Ns, message.Nr = c.nextSend, c.nextReceive
+	wire, err := message.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	c.nextSend++
+	return wire, nil
+}
+
 // Receive processes acknowledgements and, when present, returns one newly
 // accepted control message. A nil message denotes a zero-length body (ZLB) ACK
 // or a duplicate that has already been delivered.
