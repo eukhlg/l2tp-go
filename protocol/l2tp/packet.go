@@ -34,9 +34,6 @@ func (p Packet) MarshalBinary() ([]byte, error) {
 	if p.Control && !p.HasSequence {
 		return nil, fmt.Errorf("%w: control packet requires sequence numbers", ErrInvalidPacket)
 	}
-	if p.Control && p.SessionID != 0 {
-		return nil, fmt.Errorf("%w: control packet has nonzero session ID", ErrInvalidPacket)
-	}
 	body := append([]byte(nil), p.Payload...)
 	if p.Control {
 		body = body[:0]
@@ -115,9 +112,6 @@ func DecodePacket(b []byte) (Packet, error) {
 	}
 	p := Packet{Control: control, TunnelID: binary.BigEndian.Uint16(b[pos : pos+2]), SessionID: binary.BigEndian.Uint16(b[pos+2 : pos+4])}
 	pos += 4
-	if control && p.SessionID != 0 {
-		return Packet{}, fmt.Errorf("%w: control packet has nonzero session ID", ErrInvalidPacket)
-	}
 	if flags&flagSequence != 0 {
 		if end < pos+4 {
 			return Packet{}, ErrShortPacket

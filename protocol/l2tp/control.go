@@ -80,10 +80,10 @@ var (
 // ControlMessage adds typed control-message semantics to a Packet. AVPs does
 // not include the Message Type AVP, which is always generated first.
 type ControlMessage struct {
-	Type     MessageType
-	TunnelID uint16
-	Ns, Nr   uint16
-	AVPs     []AVP
+	Type                MessageType
+	TunnelID, SessionID uint16
+	Ns, Nr              uint16
+	AVPs                []AVP
 }
 
 func (m ControlMessage) MarshalBinary() ([]byte, error) {
@@ -99,7 +99,7 @@ func (m ControlMessage) MarshalBinary() ([]byte, error) {
 		}
 		avps = append(avps, avp)
 	}
-	return (Packet{Control: true, TunnelID: m.TunnelID, HasSequence: true, Ns: m.Ns, Nr: m.Nr, AVPs: avps}).MarshalBinary()
+	return (Packet{Control: true, TunnelID: m.TunnelID, SessionID: m.SessionID, HasSequence: true, Ns: m.Ns, Nr: m.Nr, AVPs: avps}).MarshalBinary()
 }
 
 func DecodeControlMessage(b []byte) (ControlMessage, error) {
@@ -110,6 +110,13 @@ func DecodeControlMessage(b []byte) (ControlMessage, error) {
 	if !p.Control {
 		return ControlMessage{}, ErrNotControlMessage
 	}
+	return decodeControlPacket(p)
+}
+
+func decodeControlPacket(p Packet) (ControlMessage, error) {
+	if !p.Control {
+		return ControlMessage{}, ErrNotControlMessage
+	}
 	if len(p.AVPs) == 0 || p.AVPs[0].VendorID != 0 || AttributeType(p.AVPs[0].Type) != AttrMessageType {
 		return ControlMessage{}, ErrMissingMessageType
 	}
@@ -117,7 +124,7 @@ func DecodeControlMessage(b []byte) (ControlMessage, error) {
 	if err != nil {
 		return ControlMessage{}, fmt.Errorf("%w: Message Type: %v", ErrInvalidAttribute, err)
 	}
-	return ControlMessage{Type: MessageType(messageType), TunnelID: p.TunnelID, Ns: p.Ns, Nr: p.Nr, AVPs: append([]AVP(nil), p.AVPs[1:]...)}, nil
+	return ControlMessage{Type: MessageType(messageType), TunnelID: p.TunnelID, SessionID: p.SessionID, Ns: p.Ns, Nr: p.Nr, AVPs: append([]AVP(nil), p.AVPs[1:]...)}, nil
 }
 
 // Find returns the first unhidden IETF AVP of the requested type.
