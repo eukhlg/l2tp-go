@@ -373,5 +373,18 @@ func (e *Engine) debugPPPControl(direction string, peer net.Addr, tunnelID, sess
 			detail = "options=" + strings.Join(parts, ",")
 		}
 	}
-	e.debugf("ppp control %s peer=%s tunnel=%d session=%d protocol=%#04x code=%s id=%d %s", direction, peer, tunnelID, sessionID, frame.Protocol, packet.Code, packet.Identifier, detail)
+	codeName := packet.Code.String()
+	if frame.Protocol == ppp.ProtocolCHAP {
+		switch packet.Code {
+		case 1:
+			codeName = "Challenge"
+		case 2:
+			codeName = "Response"
+		case 3:
+			codeName = "Success"
+		case 4:
+			codeName = "Failure"
+		}
+	}
+	e.debugf("ppp control %s peer=%s tunnel=%d session=%d protocol=%#04x code=%s id=%d %s", direction, peer, tunnelID, sessionID, frame.Protocol, codeName, packet.Identifier, detail)
 }

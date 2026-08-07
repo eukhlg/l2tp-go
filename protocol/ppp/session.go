@@ -64,14 +64,15 @@ func StaticPassword(username, password string) PasswordLookup {
 }
 
 type SessionConfig struct {
-	ServerAddress   netip.Addr
-	ClientAddress   netip.Addr
-	PrimaryDNS      netip.Addr
-	SecondaryDNS    netip.Addr
-	Authenticate    Authenticator
-	Authentication  AuthenticationMethod
-	LookupPassword  PasswordLookup
-	ChallengeSource io.Reader
+	ServerAddress     netip.Addr
+	ClientAddress     netip.Addr
+	AuthenticatorName string
+	PrimaryDNS        netip.Addr
+	SecondaryDNS      netip.Addr
+	Authenticate      Authenticator
+	Authentication    AuthenticationMethod
+	LookupPassword    PasswordLookup
+	ChallengeSource   io.Reader
 }
 
 type SessionResult struct {
@@ -100,6 +101,9 @@ func NewSession(config SessionConfig) (*Session, error) {
 	}
 	if config.Authentication == "" {
 		config.Authentication = AuthenticationPAP
+	}
+	if config.AuthenticatorName == "" {
+		config.AuthenticatorName = "l2tp-go"
 	}
 	switch config.Authentication {
 	case AuthenticationPAP:
@@ -235,6 +239,7 @@ func (s *Session) mschapv2Challenge() ([]Frame, error) {
 	}
 	s.authIdentifier++
 	data := append([]byte{16}, s.authChallenge[:]...)
+	data = append(data, []byte(s.config.AuthenticatorName)...)
 	return controlFrames(ProtocolCHAP, ControlPacket{Code: 1, Identifier: s.authIdentifier, Data: data})
 }
 
