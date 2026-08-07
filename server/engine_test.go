@@ -235,6 +235,74 @@ func TestEngineDoesNotAckZLB(t *testing.T) {
 	}
 }
 
+func TestFreshSCCRQReplacesEstablishedTunnel(t *testing.T) {
+	engine, _, peer, now := establishTunnel(t)
+	client := l2tp.NewControlChannel(0, 4)
+	wire, err := client.Queue(l2tp.ControlMessage{Type: l2tp.SCCRQ, AVPs: []l2tp.AVP{
+		l2tp.Uint16AVP(l2tp.AttrProtocolVersion, 0x0100, true),
+		l2tp.Uint32AVP(l2tp.AttrFramingCap, 3, true),
+		l2tp.Uint32AVP(l2tp.AttrBearerCap, 3, true),
+		l2tp.StringAVP(l2tp.AttrHostName, "restarted-client", true),
+		l2tp.Uint16AVP(l2tp.AttrAssignedTunnelID, 51, true),
+	}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := engine.HandleDatagram(peer, wire, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := receiveOne(t, client, result)
+	assigned, ok := response.Find(l2tp.AttrAssignedTunnelID)
+	if !ok {
+		t.Fatal("replacement SCCRP has no assigned tunnel ID")
+	}
+	serverID, err := assigned.Uint16()
+	if err != nil || response.Type != l2tp.SCCRP || serverID != 101 || engine.TunnelCount() != 1 {
+		t.Fatalf("response=%#v serverID=%d tunnels=%d err=%v", response, serverID, engine.TunnelCount(), err)
+	}
+}
+
+func TestMalformedSCCRQDoesNotReplaceEstablishedTunnel(t *testing.T) {
+	engine, _, peer, now := establishTunnel(t)
+	client := l2tp.NewControlChannel(0, 1)
+	wire, err := client.Queue(l2tp.ControlMessage{Type: l2tp.SCCRQ, AVPs: []l2tp.AVP{
+		l2tp.Uint16AVP(l2tp.AttrAssignedTunnelID, 51, true),
+	}}, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.HandleDatagram(peer, wire, now.Add(time.Second)); !errors.Is(err, l2tp.ErrMissingAttribute) {
+		t.Fatalf("err=%v", err)
+	}
+	if engine.TunnelCount() != 1 {
+		t.Fatalf("tunnel count=%d", engine.TunnelCount())
+	}
+}
+
+func TestEngineShutdownSendsStopCCN(t *testing.T) {
+	engine, client, peer, _ := establishTunnel(t)
+	packets, closed, err := engine.Shutdown()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packets) != 1 || packets[0].Peer.String() != peer.String() || len(closed) != 0 || engine.TunnelCount() != 0 {
+		t.Fatalf("packets=%#v closed=%#v tunnels=%d", packets, closed, engine.TunnelCount())
+	}
+	message, err := client.Receive(packets[0].Payload)
+	if err != nil || message == nil || message.Type != l2tp.StopCCN {
+		t.Fatalf("message=%#v err=%v", message, err)
+	}
+	resultCode, ok := message.Find(l2tp.AttrResultCode)
+	if !ok {
+		t.Fatal("StopCCN has no result code")
+	}
+	code, err := resultCode.Uint16()
+	if err != nil || code != 6 {
+		t.Fatalf("result code=%d err=%v", code, err)
+	}
+}
+
 func TestMalformedSCCRQDoesNotLeakTunnel(t *testing.T) {
 	engine := NewEngine(Config{FirstTunnelID: 1})
 	client := l2tp.NewControlChannel(0, 1)

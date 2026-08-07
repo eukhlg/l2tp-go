@@ -143,6 +143,24 @@ func TestControlChannelRetransmission(t *testing.T) {
 	}
 }
 
+func TestQueueUntrackedBypassesFullWindow(t *testing.T) {
+	c := NewControlChannel(9, 1)
+	if _, err := c.Queue(ControlMessage{Type: Hello}, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	wire, err := c.QueueUntracked(ControlMessage{Type: StopCCN})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := DecodeControlMessage(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.Type != StopCCN || message.TunnelID != 9 || message.Ns != 1 || c.Pending() != 1 {
+		t.Fatalf("message=%#v pending=%d", message, c.Pending())
+	}
+}
+
 func TestSequenceBeforeWraparound(t *testing.T) {
 	if !sequenceBefore(0xffff, 0) || sequenceBefore(0, 0xffff) {
 		t.Fatal("bad wraparound comparison")
