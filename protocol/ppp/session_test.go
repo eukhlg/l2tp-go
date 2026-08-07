@@ -12,7 +12,7 @@ func TestSessionMSCHAPv2Authentication(t *testing.T) {
 	peerChallenge, _ := hex.DecodeString("21402324255E262A28295F2B3A337C7E")
 	session, err := NewSession(SessionConfig{
 		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
-		Authentication: AuthenticationMSCHAPv2, LookupPassword: StaticPassword("User", "clientPass"), ChallengeSource: bytes.NewReader(authChallenge),
+		Authentication: AuthenticationMSCHAPv2, LookupPassword: StaticPassword("User", "clientPass"), ChallengeSource: bytes.NewReader(authChallenge), AuthenticatorName: "vpn.example",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func TestSessionMSCHAPv2Authentication(t *testing.T) {
 		t.Fatalf("phase=%d frames=%d", session.Phase, len(result.Frames))
 	}
 	challenge := decodeControl(t, result.Frames[0])
-	if challenge.Code != 1 || !bytes.Equal(challenge.Data[1:], authChallenge) {
+	if challenge.Code != 1 || !bytes.Equal(challenge.Data[1:17], authChallenge) || string(challenge.Data[17:]) != "vpn.example" {
 		t.Fatalf("challenge=%#v", challenge)
 	}
 
