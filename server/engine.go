@@ -25,12 +25,14 @@ type Config struct {
 	ReceiveWindow  uint16
 	FirstTunnelID  uint16
 	FirstSessionID uint16
+	PPP            *ppp.SessionConfig
 }
 
 type DataFrame struct {
 	TunnelID uint16
 	Session  l2tp.Session
 	PPP      ppp.Frame
+	IPv4     []byte
 	Peer     net.Addr
 }
 
@@ -48,6 +50,7 @@ type tunnelRuntime struct {
 	peer    net.Addr
 	state   *l2tp.ServerTunnel
 	channel *l2tp.ControlChannel
+	ppp     map[uint16]*ppp.Session
 }
 
 // Engine processes complete UDP datagrams. It is safe for concurrent use.
@@ -125,6 +128,28 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 	}
 	closed := runtime.state.State == l2tp.TunnelClosed
 	result := Result{Replies: [][]byte{ack}}
+	if message.Type == l2tp.ICCN && e.config.PPP != nil {
+		session, ok := runtime.state.Session(message.SessionID)
+		if !ok {
+			return Result{}, l2tp.ErrUnknownSession
+		}
+		pppSession, err := ppp.NewSession(*e.config.PPP)
+		if err != nil {
+			return Result{}, err
+		}
+		runtime.ppp[session.LocalID] = pppSession
+		frames, err := pppSession.Start()
+		if err != nil {
+			return Result{}, err
+		}
+		for _, frame := range frames {
+			wire, err := encodeDataFrame(runtime, session, frame)
+			if err != nil {
+				return Result{}, err
+			}
+			result.Replies = append(result.Replies, wire)
+		}
+	}
 	if closed {
 		e.removeTunnel(runtime.state.LocalTunnelID)
 	}
@@ -172,7 +197,7 @@ func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byt
 	}
 	localID := e.allocateTunnelID()
 	state := l2tp.NewServerTunnel(l2tp.ServerTunnelConfig{LocalTunnelID: localID, FirstSessionID: e.config.FirstSessionID, HostName: e.config.HostName, VendorName: e.config.VendorName, ReceiveWindow: e.config.ReceiveWindow})
-	runtime := &tunnelRuntime{peer: peer, state: state, channel: l2tp.NewControlChannel(peerID, peerWindow)}
+	runtime := &tunnelRuntime{peer: peer, state: state, channel: l2tp.NewControlChannel(peerID, peerWindow), ppp: make(map[uint16]*ppp.Session)}
 	e.tunnels[localID] = runtime
 	e.tunnelByPeer[peerKey(peer)] = localID
 	return runtime, true, nil
@@ -194,7 +219,60 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Data: &DataFrame{TunnelID: packet.TunnelID, Session: session, PPP: frame, Peer: peer}}, nil
+	data := &DataFrame{TunnelID: packet.TunnelID, Session: session, PPP: frame, Peer: peer}
+	pppSession := runtime.ppp[packet.SessionID]
+	if pppSession == nil {
+		return Result{Data: data}, nil
+	}
+	pppResult, err := pppSession.Handle(frame)
+	if err != nil {
+		return Result{}, err
+	}
+	result := Result{}
+	for _, response := range pppResult.Frames {
+		wire, err := encodeDataFrame(runtime, session, response)
+		if err != nil {
+			return Result{}, err
+		}
+		result.Replies = append(result.Replies, wire)
+	}
+	if pppResult.IPv4 != nil {
+		data.IPv4 = pppResult.IPv4
+		result.Data = data
+	}
+	return result, nil
+}
+
+// SendIPv4 wraps an IPv4 packet for transmission to an established PPP
+// session. It is used by routers to deliver return traffic to the client.
+func (e *Engine) SendIPv4(tunnelID, sessionID uint16, payload []byte) (Datagram, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	runtime, ok := e.tunnels[tunnelID]
+	if !ok {
+		return Datagram{}, ErrUnknownTunnel
+	}
+	session, ok := runtime.state.Session(sessionID)
+	if !ok || session.State != l2tp.SessionEstablished {
+		return Datagram{}, ErrSessionNotEstablished
+	}
+	pppSession := runtime.ppp[sessionID]
+	if pppSession == nil || pppSession.Phase != ppp.PhaseOpen {
+		return Datagram{}, ErrSessionNotEstablished
+	}
+	wire, err := encodeDataFrame(runtime, session, ppp.Frame{Protocol: ppp.ProtocolIPv4, Payload: payload})
+	if err != nil {
+		return Datagram{}, err
+	}
+	return Datagram{Payload: wire, Peer: runtime.peer}, nil
+}
+
+func encodeDataFrame(runtime *tunnelRuntime, session l2tp.Session, frame ppp.Frame) ([]byte, error) {
+	frameWire, err := frame.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return (l2tp.Packet{TunnelID: runtime.state.PeerTunnelID, SessionID: session.PeerID, Payload: frameWire}).MarshalBinary()
 }
 
 func (e *Engine) Retransmit(now time.Time, timeout time.Duration, maxRetries int) ([]Datagram, error) {

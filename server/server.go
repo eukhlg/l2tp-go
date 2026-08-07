@@ -9,10 +9,15 @@ import (
 
 type DataHandler func(context.Context, DataFrame) error
 
+// IPv4Router accepts a packet from a client. The send callback may be used
+// synchronously to route zero or more return packets to that same PPP session.
+type IPv4Router func(context.Context, DataFrame, func([]byte) error) error
+
 type Server struct {
 	Conn              net.PacketConn
 	Engine            *Engine
 	HandleData        DataHandler
+	RouteIPv4         IPv4Router
 	RetransmitTimeout time.Duration
 	MaxRetries        int
 }
@@ -62,6 +67,20 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			if result.Data != nil && s.HandleData != nil {
 				if err := s.HandleData(ctx, *result.Data); err != nil {
+					return err
+				}
+			}
+			if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4 != nil {
+				frame := *result.Data
+				send := func(payload []byte) error {
+					packet, err := s.Engine.SendIPv4(frame.TunnelID, frame.Session.LocalID, payload)
+					if err != nil {
+						return err
+					}
+					_, err = s.Conn.WriteTo(packet.Payload, packet.Peer)
+					return err
+				}
+				if err := s.RouteIPv4(ctx, frame, send); err != nil {
 					return err
 				}
 			}

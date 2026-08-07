@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -17,7 +18,10 @@ func (p testPeer) Network() string { return "udp" }
 func (p testPeer) String() string  { return string(p) }
 
 func TestEngineTunnelSessionAndData(t *testing.T) {
-	engine := NewEngine(Config{HostName: "server", FirstTunnelID: 100, FirstSessionID: 200, ReceiveWindow: 4})
+	engine := NewEngine(Config{HostName: "server", FirstTunnelID: 100, FirstSessionID: 200, ReceiveWindow: 4, PPP: &ppp.SessionConfig{
+		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
+		PrimaryDNS: netip.MustParseAddr("1.1.1.1"), Authenticate: ppp.StaticCredentials("alice", "secret"),
+	}})
 	client := l2tp.NewControlChannel(0, 4)
 	peer := testPeer("192.0.2.1:1701")
 	now := time.Unix(100, 0)
@@ -81,9 +85,42 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receiveAck(t, client, result)
+	if len(result.Replies) != 2 {
+		t.Fatalf("ICCN replies=%d", len(result.Replies))
+	}
+	receiveAck(t, client, Result{Replies: result.Replies[:1]})
+	serverLCP := decodePPPControlDatagram(t, result.Replies[1])
 
-	frameWire, err := (ppp.Frame{Protocol: 0x0021, Payload: []byte{0x45, 0, 0, 20}}).MarshalBinary()
+	peerLCPData, _ := ppp.EncodeOptions(ppp.Option{Type: 1, Value: []byte{0x05, 0xdc}})
+	result = sendPPPControl(t, engine, peer, now, serverTunnelID, serverSessionID, ppp.ProtocolLCP, ppp.ControlPacket{Code: ppp.ConfigureRequest, Identifier: 4, Data: peerLCPData})
+	if got := decodePPPControlDatagram(t, result.Replies[0]); got.Code != ppp.ConfigureAck {
+		t.Fatalf("LCP reply=%#v", got)
+	}
+	result = sendPPPControl(t, engine, peer, now, serverTunnelID, serverSessionID, ppp.ProtocolLCP, ppp.ControlPacket{Code: ppp.ConfigureAck, Identifier: serverLCP.Identifier, Data: serverLCP.Data})
+	if len(result.Replies) != 0 {
+		t.Fatalf("LCP ACK replies=%d", len(result.Replies))
+	}
+
+	papData := append([]byte{5}, []byte("alice")...)
+	papData = append(papData, 6)
+	papData = append(papData, []byte("secret")...)
+	result = sendPPPControl(t, engine, peer, now, serverTunnelID, serverSessionID, ppp.ProtocolPAP, ppp.ControlPacket{Code: 1, Identifier: 5, Data: papData})
+	if len(result.Replies) != 2 || decodePPPControlDatagram(t, result.Replies[0]).Code != 2 {
+		t.Fatalf("PAP replies=%d", len(result.Replies))
+	}
+	serverIPCP := decodePPPControlDatagram(t, result.Replies[1])
+	clientIPCPData, _ := ppp.EncodeOptions(ppp.IPv4Option(3, netip.MustParseAddr("10.0.0.2")))
+	result = sendPPPControl(t, engine, peer, now, serverTunnelID, serverSessionID, ppp.ProtocolIPCP, ppp.ControlPacket{Code: ppp.ConfigureRequest, Identifier: 6, Data: clientIPCPData})
+	if got := decodePPPControlDatagram(t, result.Replies[0]); got.Code != ppp.ConfigureAck {
+		t.Fatalf("IPCP reply=%#v", got)
+	}
+	result = sendPPPControl(t, engine, peer, now, serverTunnelID, serverSessionID, ppp.ProtocolIPCP, ppp.ControlPacket{Code: ppp.ConfigureAck, Identifier: serverIPCP.Identifier, Data: serverIPCP.Data})
+	if len(result.Replies) != 0 {
+		t.Fatalf("IPCP ACK replies=%d", len(result.Replies))
+	}
+
+	ipv4 := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
+	frameWire, err := (ppp.Frame{Protocol: 0x0021, Payload: ipv4}).MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,8 +132,19 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Data == nil || result.Data.PPP.Protocol != 0x0021 || !bytes.Equal(result.Data.PPP.Payload, []byte{0x45, 0, 0, 20}) {
+	if result.Data == nil || result.Data.PPP.Protocol != 0x0021 || !bytes.Equal(result.Data.PPP.Payload, ipv4) {
 		t.Fatalf("data=%#v", result.Data)
+	}
+	outbound, err := engine.SendIPv4(serverTunnelID, serverSessionID, []byte{0x45, 1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	outPacket, err := l2tp.DecodePacket(outbound.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outPacket.TunnelID != 50 || outPacket.SessionID != 70 {
+		t.Fatalf("outbound=%#v", outPacket)
 	}
 }
 
@@ -212,6 +260,44 @@ func receiveAck(t *testing.T, channel *l2tp.ControlChannel, result Result) {
 	if err != nil || message != nil {
 		t.Fatalf("message=%#v err=%v", message, err)
 	}
+}
+
+func sendPPPControl(t *testing.T, engine *Engine, peer net.Addr, now time.Time, tunnelID, sessionID, protocol uint16, control ppp.ControlPacket) Result {
+	t.Helper()
+	payload, err := control.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := (ppp.Frame{Protocol: protocol, Payload: payload}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := (l2tp.Packet{TunnelID: tunnelID, SessionID: sessionID, Payload: frame}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := engine.HandleDatagram(peer, wire, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func decodePPPControlDatagram(t *testing.T, wire []byte) ppp.ControlPacket {
+	t.Helper()
+	packet, err := l2tp.DecodePacket(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := ppp.DecodeFrame(packet.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, err := ppp.DecodeControlPacket(frame.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return control
 }
 
 func TestPeerKey(t *testing.T) {
