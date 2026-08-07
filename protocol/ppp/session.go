@@ -13,6 +13,15 @@ import (
 
 type Phase uint8
 
+func (p Phase) String() string {
+	if int(p) < len(phaseNames) {
+		return phaseNames[p]
+	}
+	return fmt.Sprintf("Phase(%d)", p)
+}
+
+var phaseNames = [...]string{"lcp", "authenticate", "ipcp", "open", "closed"}
+
 const (
 	PhaseLCP Phase = iota
 	PhaseAuthenticate
@@ -82,6 +91,8 @@ type Session struct {
 	authChallenge   [16]byte
 	authIdentifier  uint8
 }
+
+func (s *Session) Authentication() AuthenticationMethod { return s.config.Authentication }
 
 func NewSession(config SessionConfig) (*Session, error) {
 	if !config.ServerAddress.Is4() || !config.ClientAddress.Is4() {

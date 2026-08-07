@@ -3,14 +3,32 @@ package server
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
 	"l2tp-go/protocol/l2tp"
 	"l2tp-go/protocol/ppp"
 )
+
+func TestEngineDebugTraceMalformedDatagram(t *testing.T) {
+	var logs []string
+	engine := NewEngine(Config{Debugf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }})
+	if _, err := engine.HandleDatagram(testPeer("peer"), []byte{1}, time.Time{}); err == nil {
+		t.Fatal("malformed datagram accepted")
+	}
+	if len(logs) != 2 || !strings.Contains(logs[0], "udp rx") || !strings.Contains(logs[1], "decode_error") {
+		t.Fatalf("logs=%q", logs)
+	}
+	for _, entry := range logs {
+		if strings.Contains(entry, "010203") {
+			t.Fatalf("payload leaked: %s", entry)
+		}
+	}
+}
 
 type testPeer string
 

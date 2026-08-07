@@ -58,12 +58,14 @@ func (s *Server) Serve(ctx context.Context) error {
 		} else {
 			result, handleErr := s.Engine.HandleDatagram(peer, buffer[:n], time.Now())
 			if handleErr != nil {
+				s.Engine.debugf("datagram rejected peer=%s error=%v", peer, handleErr)
 				continue
 			} // A malformed peer must not stop the listener.
 			for _, reply := range result.Replies {
 				if _, err := s.Conn.WriteTo(reply, peer); err != nil {
 					return err
 				}
+				s.Engine.debugf("udp tx peer=%s bytes=%d", peer, len(reply))
 			}
 			if result.Data != nil && s.HandleData != nil {
 				if err := s.HandleData(ctx, *result.Data); err != nil {

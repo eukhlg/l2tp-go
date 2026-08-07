@@ -9,6 +9,14 @@ import (
 // MessageType identifies an L2TPv2 control message (RFC 2661 section 6.1).
 type MessageType uint16
 
+func (m MessageType) String() string {
+	names := map[MessageType]string{SCCRQ: "SCCRQ", SCCRP: "SCCRP", SCCCN: "SCCCN", StopCCN: "StopCCN", Hello: "Hello", OCRQ: "OCRQ", OCRP: "OCRP", OCCN: "OCCN", ICRQ: "ICRQ", ICRP: "ICRP", ICCN: "ICCN", CDN: "CDN", WEN: "WEN", SLI: "SLI"}
+	if name := names[m]; name != "" {
+		return name
+	}
+	return fmt.Sprintf("MessageType(%d)", m)
+}
+
 const (
 	SCCRQ   MessageType = 1
 	SCCRP   MessageType = 2

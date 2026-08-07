@@ -26,6 +26,7 @@ type Config struct {
 	FirstTunnelID  uint16
 	FirstSessionID uint16
 	PPP            *ppp.SessionConfig
+	Debugf         func(format string, args ...any)
 }
 
 type DataFrame struct {
@@ -76,10 +77,13 @@ func NewEngine(config Config) *Engine {
 func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Result, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.debugf("udp rx peer=%s bytes=%d", peer, len(wire))
 	packet, err := l2tp.DecodePacket(wire)
 	if err != nil {
+		e.debugf("udp drop peer=%s decode_error=%v", peer, err)
 		return Result{}, err
 	}
+	e.debugf("l2tp rx peer=%s control=%t tunnel=%d session=%d ns=%d nr=%d payload_bytes=%d avps=%d", peer, packet.Control, packet.TunnelID, packet.SessionID, packet.Ns, packet.Nr, len(packet.Payload), len(packet.AVPs))
 	if packet.Control {
 		return e.handleControl(peer, packet, wire, now)
 	}
@@ -93,6 +97,7 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 	}
 	message, err := runtime.channel.Receive(wire)
 	if err != nil {
+		e.debugf("control drop peer=%s tunnel=%d error=%v", peer, runtime.state.LocalTunnelID, err)
 		if created {
 			e.removeTunnel(runtime.state.LocalTunnelID)
 		}
@@ -100,16 +105,21 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 	}
 	if message == nil {
 		if len(packet.AVPs) == 0 {
+			e.debugf("control zlb peer=%s tunnel=%d nr=%d", peer, runtime.state.LocalTunnelID, packet.Nr)
 			return Result{}, nil // ZLBs acknowledge; they are never acknowledged.
 		}
 		ack, err := runtime.channel.Ack()
 		if err != nil {
 			return Result{}, err
 		}
+		e.debugf("control duplicate peer=%s tunnel=%d ns=%d", peer, runtime.state.LocalTunnelID, packet.Ns)
 		return Result{Replies: [][]byte{ack}}, nil
 	}
+	stateBefore := runtime.state.State
+	e.debugf("control message peer=%s type=%s tunnel=%d session=%d state=%s", peer, message.Type, message.TunnelID, message.SessionID, stateBefore)
 	reply, err := runtime.state.Handle(*message)
 	if err != nil {
+		e.debugf("control reject peer=%s type=%s state=%s error=%v", peer, message.Type, stateBefore, err)
 		if created {
 			e.removeTunnel(runtime.state.LocalTunnelID)
 		}
@@ -120,6 +130,7 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 		if err != nil {
 			return Result{}, err
 		}
+		e.debugf("control tx peer=%s type=%s local_tunnel=%d peer_tunnel=%d session=%d state=%s->%s bytes=%d", peer, reply.Type, runtime.state.LocalTunnelID, runtime.state.PeerTunnelID, reply.SessionID, stateBefore, runtime.state.State, len(wire))
 		return Result{Replies: [][]byte{wire}}, nil
 	}
 	ack, err := runtime.channel.Ack()
@@ -138,6 +149,7 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 			return Result{}, err
 		}
 		runtime.ppp[session.LocalID] = pppSession
+		e.debugf("ppp start peer=%s tunnel=%d session=%d auth=%s", peer, runtime.state.LocalTunnelID, session.LocalID, pppSession.Authentication())
 		frames, err := pppSession.Start()
 		if err != nil {
 			return Result{}, err
@@ -151,6 +163,7 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 		}
 	}
 	if closed {
+		e.debugf("tunnel closed peer=%s tunnel=%d", peer, runtime.state.LocalTunnelID)
 		e.removeTunnel(runtime.state.LocalTunnelID)
 	}
 	return result, nil
@@ -217,6 +230,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	}
 	frame, err := ppp.DecodeFrame(packet.Payload)
 	if err != nil {
+		e.debugf("ppp drop peer=%s tunnel=%d session=%d decode_error=%v", peer, packet.TunnelID, packet.SessionID, err)
 		return Result{}, err
 	}
 	data := &DataFrame{TunnelID: packet.TunnelID, Session: session, PPP: frame, Peer: peer}
@@ -224,9 +238,15 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	if pppSession == nil {
 		return Result{Data: data}, nil
 	}
+	phaseBefore := pppSession.Phase
+	e.debugf("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
 	pppResult, err := pppSession.Handle(frame)
 	if err != nil {
+		e.debugf("ppp reject peer=%s tunnel=%d session=%d protocol=%#04x phase=%s error=%v", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, err)
 		return Result{}, err
+	}
+	if phaseBefore != pppSession.Phase {
+		e.debugf("ppp phase peer=%s tunnel=%d session=%d %s->%s", peer, packet.TunnelID, packet.SessionID, phaseBefore, pppSession.Phase)
 	}
 	result := Result{}
 	for _, response := range pppResult.Frames {
@@ -235,8 +255,10 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 			return Result{}, err
 		}
 		result.Replies = append(result.Replies, wire)
+		e.debugf("ppp tx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, response.Protocol, pppSession.Phase, len(response.Payload))
 	}
 	if pppResult.IPv4 != nil {
+		e.debugf("ipv4 routed peer=%s tunnel=%d session=%d bytes=%d", peer, packet.TunnelID, packet.SessionID, len(pppResult.IPv4))
 		data.IPv4 = pppResult.IPv4
 		result.Data = data
 	}
@@ -318,4 +340,10 @@ func peerKey(addr net.Addr) string {
 		return ""
 	}
 	return addr.Network() + "\x00" + addr.String()
+}
+
+func (e *Engine) debugf(format string, args ...any) {
+	if e.config.Debugf != nil {
+		e.config.Debugf(format, args...)
+	}
 }
