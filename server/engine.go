@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -18,16 +19,22 @@ var (
 	ErrUnknownTunnel         = errors.New("l2tp server: unknown tunnel")
 	ErrPeerAddress           = errors.New("l2tp server: tunnel peer address changed")
 	ErrSessionNotEstablished = errors.New("l2tp server: session is not established")
+	ErrGlobalSessionLimit    = errors.New("l2tp server: global session limit reached")
+	ErrTunnelSessionLimit    = errors.New("l2tp server: tunnel session limit reached")
 )
 
 type Config struct {
-	HostName       string
-	VendorName     string
-	ReceiveWindow  uint16
-	FirstTunnelID  uint16
-	FirstSessionID uint16
-	PPP            *ppp.SessionConfig
-	Debugf         func(format string, args ...any)
+	HostName             string
+	VendorName           string
+	ReceiveWindow        uint16
+	FirstTunnelID        uint16
+	FirstSessionID       uint16
+	PPP                  *ppp.SessionConfig
+	AddressPool          *AddressPool
+	MaxSessions          int
+	MaxSessionsPerTunnel int
+	MaxSessionsPerUser   int
+	Debugf               func(format string, args ...any)
 }
 
 type DataFrame struct {
@@ -41,6 +48,14 @@ type DataFrame struct {
 type Result struct {
 	Replies [][]byte
 	Data    *DataFrame
+	Opened  *SessionInfo
+	Closed  []SessionInfo
+}
+
+type SessionInfo struct {
+	TunnelID, SessionID uint16
+	Address             netip.Addr
+	Peer                net.Addr
 }
 
 type Datagram struct {
@@ -48,11 +63,18 @@ type Datagram struct {
 	Peer    net.Addr
 }
 
+type sessionRuntime struct {
+	ppp      *ppp.Session
+	address  netip.Addr
+	username string
+	admitted bool
+}
+
 type tunnelRuntime struct {
-	peer    net.Addr
-	state   *l2tp.ServerTunnel
-	channel *l2tp.ControlChannel
-	ppp     map[uint16]*ppp.Session
+	peer     net.Addr
+	state    *l2tp.ServerTunnel
+	channel  *l2tp.ControlChannel
+	sessions map[uint16]*sessionRuntime
 }
 
 // Engine processes complete UDP datagrams. It is safe for concurrent use.
@@ -62,6 +84,7 @@ type Engine struct {
 	nextTunnelID uint16
 	tunnels      map[uint16]*tunnelRuntime
 	tunnelByPeer map[string]uint16
+	userSessions map[string]int
 }
 
 func NewEngine(config Config) *Engine {
@@ -72,7 +95,7 @@ func NewEngine(config Config) *Engine {
 	if config.VendorName == "" {
 		config.VendorName = "l2tp-go"
 	}
-	return &Engine{config: config, nextTunnelID: first, tunnels: make(map[uint16]*tunnelRuntime), tunnelByPeer: make(map[string]uint16)}
+	return &Engine{config: config, nextTunnelID: first, tunnels: make(map[uint16]*tunnelRuntime), tunnelByPeer: make(map[string]uint16), userSessions: make(map[string]int)}
 }
 
 func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Result, error) {
@@ -118,6 +141,18 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 	}
 	stateBefore := runtime.state.State
 	e.debugf("control message peer=%s type=%s tunnel=%d session=%d state=%s", peer, message.Type, message.TunnelID, message.SessionID, stateBefore)
+	if message.Type == l2tp.ICRQ {
+		if e.config.MaxSessions > 0 && e.sessionCount() >= e.config.MaxSessions {
+			return e.rejectCall(runtime, *message, now, ErrGlobalSessionLimit)
+		}
+		if e.config.MaxSessionsPerTunnel > 0 && runtime.state.SessionCount() >= e.config.MaxSessionsPerTunnel {
+			return e.rejectCall(runtime, *message, now, ErrTunnelSessionLimit)
+		}
+	}
+	removedSessionID := uint16(0)
+	if message.Type == l2tp.CDN {
+		removedSessionID = message.SessionID
+	}
 	reply, err := runtime.state.Handle(*message)
 	if err != nil {
 		e.debugf("control reject peer=%s type=%s state=%s error=%v", peer, message.Type, stateBefore, err)
@@ -134,23 +169,53 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 		e.debugf("control tx peer=%s type=%s local_tunnel=%d peer_tunnel=%d session=%d state=%s->%s bytes=%d", peer, reply.Type, runtime.state.LocalTunnelID, runtime.state.PeerTunnelID, reply.SessionID, stateBefore, runtime.state.State, len(wire))
 		return Result{Replies: [][]byte{wire}}, nil
 	}
+	result := Result{}
+	if removedSessionID != 0 {
+		if closed := e.releaseSession(runtime, removedSessionID); closed != nil {
+			result.Closed = append(result.Closed, *closed)
+		}
+	}
 	ack, err := runtime.channel.Ack()
 	if err != nil {
 		return Result{}, err
 	}
 	closed := runtime.state.State == l2tp.TunnelClosed
-	result := Result{Replies: [][]byte{ack}}
+	result.Replies = [][]byte{ack}
 	if message.Type == l2tp.ICCN && e.config.PPP != nil {
 		session, ok := runtime.state.Session(message.SessionID)
 		if !ok {
 			return Result{}, l2tp.ErrUnknownSession
 		}
-		pppSession, err := ppp.NewSession(*e.config.PPP)
+		pppConfig := *e.config.PPP
+		address := pppConfig.ClientAddress
+		if e.config.AddressPool != nil {
+			address, err = e.config.AddressPool.Acquire()
+			if err != nil {
+				runtime.state.RemoveSession(session.LocalID)
+				return e.rejectEstablishedCall(runtime, session, now, err)
+			}
+			pppConfig.ClientAddress = address
+		}
+		sessionRuntime := &sessionRuntime{address: address}
+		pppConfig.Authorize = func(username string) bool {
+			if e.config.MaxSessionsPerUser > 0 && e.userSessions[username] >= e.config.MaxSessionsPerUser {
+				e.debugf("session rejected tunnel=%d session=%d user=%s reason=per-user-limit current=%d limit=%d", runtime.state.LocalTunnelID, session.LocalID, username, e.userSessions[username], e.config.MaxSessionsPerUser)
+				return false
+			}
+			e.userSessions[username]++
+			sessionRuntime.username, sessionRuntime.admitted = username, true
+			return true
+		}
+		pppSession, err := ppp.NewSession(pppConfig)
 		if err != nil {
+			if e.config.AddressPool != nil {
+				e.config.AddressPool.Release(address)
+			}
 			return Result{}, err
 		}
-		runtime.ppp[session.LocalID] = pppSession
-		e.debugf("ppp start peer=%s tunnel=%d session=%d auth=%s", peer, runtime.state.LocalTunnelID, session.LocalID, pppSession.Authentication())
+		sessionRuntime.ppp = pppSession
+		runtime.sessions[session.LocalID] = sessionRuntime
+		e.debugf("ppp start peer=%s tunnel=%d session=%d address=%s auth=%s", peer, runtime.state.LocalTunnelID, session.LocalID, address, pppSession.Authentication())
 		frames, err := pppSession.Start()
 		if err != nil {
 			return Result{}, err
@@ -165,9 +230,35 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 	}
 	if closed {
 		e.debugf("tunnel closed peer=%s tunnel=%d", peer, runtime.state.LocalTunnelID)
-		e.removeTunnel(runtime.state.LocalTunnelID)
+		result.Closed = append(result.Closed, e.removeTunnel(runtime.state.LocalTunnelID)...)
 	}
 	return result, nil
+}
+
+func (e *Engine) rejectCall(runtime *tunnelRuntime, message l2tp.ControlMessage, now time.Time, reason error) (Result, error) {
+	assigned, ok := message.Find(l2tp.AttrAssignedSessionID)
+	if !ok {
+		return Result{}, reason
+	}
+	peerSessionID, err := assigned.Uint16()
+	if err != nil {
+		return Result{}, err
+	}
+	return e.queueCallRejection(runtime, peerSessionID, now, reason)
+}
+
+func (e *Engine) rejectEstablishedCall(runtime *tunnelRuntime, session l2tp.Session, now time.Time, reason error) (Result, error) {
+	return e.queueCallRejection(runtime, session.PeerID, now, reason)
+}
+
+func (e *Engine) queueCallRejection(runtime *tunnelRuntime, peerSessionID uint16, now time.Time, reason error) (Result, error) {
+	message := l2tp.ControlMessage{Type: l2tp.CDN, SessionID: peerSessionID, AVPs: []l2tp.AVP{l2tp.Uint16AVP(l2tp.AttrResultCode, 4, true)}}
+	wire, err := runtime.channel.Queue(message, now)
+	if err != nil {
+		return Result{}, err
+	}
+	e.debugf("session rejected tunnel=%d peer_session=%d reason=%v", runtime.state.LocalTunnelID, peerSessionID, reason)
+	return Result{Replies: [][]byte{wire}}, nil
 }
 
 func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byte) (*tunnelRuntime, bool, error) {
@@ -211,7 +302,7 @@ func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byt
 	}
 	localID := e.allocateTunnelID()
 	state := l2tp.NewServerTunnel(l2tp.ServerTunnelConfig{LocalTunnelID: localID, FirstSessionID: e.config.FirstSessionID, HostName: e.config.HostName, VendorName: e.config.VendorName, ReceiveWindow: e.config.ReceiveWindow})
-	runtime := &tunnelRuntime{peer: peer, state: state, channel: l2tp.NewControlChannel(peerID, peerWindow), ppp: make(map[uint16]*ppp.Session)}
+	runtime := &tunnelRuntime{peer: peer, state: state, channel: l2tp.NewControlChannel(peerID, peerWindow), sessions: make(map[uint16]*sessionRuntime)}
 	e.tunnels[localID] = runtime
 	e.tunnelByPeer[peerKey(peer)] = localID
 	return runtime, true, nil
@@ -235,10 +326,11 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 		return Result{}, err
 	}
 	data := &DataFrame{TunnelID: packet.TunnelID, Session: session, PPP: frame, Peer: peer}
-	pppSession := runtime.ppp[packet.SessionID]
-	if pppSession == nil {
+	sessionRuntime := runtime.sessions[packet.SessionID]
+	if sessionRuntime == nil || sessionRuntime.ppp == nil {
 		return Result{Data: data}, nil
 	}
+	pppSession := sessionRuntime.ppp
 	phaseBefore := pppSession.Phase
 	e.debugf("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
 	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
@@ -247,10 +339,20 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 		e.debugf("ppp reject peer=%s tunnel=%d session=%d protocol=%#04x phase=%s error=%v", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, err)
 		return Result{}, err
 	}
+	var closedInfo *SessionInfo
+	if pppSession.Phase == ppp.PhaseClosed {
+		closedInfo = e.releaseSession(runtime, packet.SessionID)
+	}
 	if phaseBefore != pppSession.Phase {
 		e.debugf("ppp phase peer=%s tunnel=%d session=%d %s->%s", peer, packet.TunnelID, packet.SessionID, phaseBefore, pppSession.Phase)
 	}
 	result := Result{}
+	if closedInfo != nil {
+		result.Closed = append(result.Closed, *closedInfo)
+	}
+	if phaseBefore != ppp.PhaseOpen && pppSession.Phase == ppp.PhaseOpen {
+		result.Opened = &SessionInfo{TunnelID: packet.TunnelID, SessionID: packet.SessionID, Address: sessionRuntime.address, Peer: peer}
+	}
 	for _, response := range pppResult.Frames {
 		wire, err := encodeDataFrame(runtime, session, response)
 		if err != nil {
@@ -281,8 +383,8 @@ func (e *Engine) SendIPv4(tunnelID, sessionID uint16, payload []byte) (Datagram,
 	if !ok || session.State != l2tp.SessionEstablished {
 		return Datagram{}, ErrSessionNotEstablished
 	}
-	pppSession := runtime.ppp[sessionID]
-	if pppSession == nil || pppSession.Phase != ppp.PhaseOpen {
+	sessionRuntime := runtime.sessions[sessionID]
+	if sessionRuntime == nil || sessionRuntime.ppp == nil || sessionRuntime.ppp.Phase != ppp.PhaseOpen {
 		return Datagram{}, ErrSessionNotEstablished
 	}
 	wire, err := encodeDataFrame(runtime, session, ppp.Frame{Protocol: ppp.ProtocolIPv4, Payload: payload})
@@ -330,12 +432,47 @@ func (e *Engine) allocateTunnelID() uint16 {
 	}
 }
 
-func (e *Engine) removeTunnel(id uint16) {
+func (e *Engine) removeTunnel(id uint16) []SessionInfo {
 	runtime := e.tunnels[id]
+	var closed []SessionInfo
 	if runtime != nil {
+		for sessionID := range runtime.sessions {
+			if info := e.releaseSession(runtime, sessionID); info != nil {
+				closed = append(closed, *info)
+			}
+		}
 		delete(e.tunnelByPeer, peerKey(runtime.peer))
 	}
 	delete(e.tunnels, id)
+	return closed
+}
+
+func (e *Engine) sessionCount() int {
+	total := 0
+	for _, runtime := range e.tunnels {
+		total += runtime.state.SessionCount()
+	}
+	return total
+}
+
+func (e *Engine) releaseSession(runtime *tunnelRuntime, sessionID uint16) *SessionInfo {
+	session := runtime.sessions[sessionID]
+	if session == nil {
+		return nil
+	}
+	if e.config.AddressPool != nil {
+		e.config.AddressPool.Release(session.address)
+	}
+	if session.admitted && e.userSessions[session.username] > 0 {
+		e.userSessions[session.username]--
+		if e.userSessions[session.username] == 0 {
+			delete(e.userSessions, session.username)
+		}
+	}
+	delete(runtime.sessions, sessionID)
+	runtime.state.RemoveSession(sessionID)
+	e.debugf("ppp released tunnel=%d session=%d address=%s user=%s", runtime.state.LocalTunnelID, sessionID, session.address, session.username)
+	return &SessionInfo{TunnelID: runtime.state.LocalTunnelID, SessionID: sessionID, Address: session.address, Peer: runtime.peer}
 }
 
 func peerKey(addr net.Addr) string {

@@ -140,6 +140,10 @@ func (t *ServerTunnel) Session(localID uint16) (Session, bool) {
 	return *session, true
 }
 
+func (t *ServerTunnel) SessionCount() int { return len(t.sessions) }
+
+func (t *ServerTunnel) RemoveSession(localID uint16) { delete(t.sessions, localID) }
+
 func (t *ServerTunnel) handleSCCRQ(message ControlMessage) (*ControlMessage, error) {
 	if t.State != TunnelIdle || message.TunnelID != 0 || message.SessionID != 0 {
 		return nil, t.unexpected(message)

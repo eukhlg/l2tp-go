@@ -12,12 +12,16 @@ type DataHandler func(context.Context, DataFrame) error
 // IPv4Router accepts a packet from a client. The send callback may be used
 // synchronously to route zero or more return packets to that same PPP session.
 type IPv4Router func(context.Context, DataFrame, func([]byte) error) error
+type SessionOpenHandler func(context.Context, SessionInfo, func([]byte) error) error
+type SessionCloseHandler func(context.Context, SessionInfo)
 
 type Server struct {
 	Conn              net.PacketConn
 	Engine            *Engine
 	HandleData        DataHandler
 	RouteIPv4         IPv4Router
+	SessionOpened     SessionOpenHandler
+	SessionClosed     SessionCloseHandler
 	RetransmitTimeout time.Duration
 	MaxRetries        int
 }
@@ -66,6 +70,25 @@ func (s *Server) Serve(ctx context.Context) error {
 					return err
 				}
 				s.Engine.debugf("udp tx peer=%s bytes=%d", peer, len(reply))
+			}
+			if result.Opened != nil && s.SessionOpened != nil {
+				info := *result.Opened
+				send := func(payload []byte) error {
+					packet, err := s.Engine.SendIPv4(info.TunnelID, info.SessionID, payload)
+					if err != nil {
+						return err
+					}
+					_, err = s.Conn.WriteTo(packet.Payload, packet.Peer)
+					return err
+				}
+				if err := s.SessionOpened(ctx, info, send); err != nil {
+					return err
+				}
+			}
+			if s.SessionClosed != nil {
+				for _, info := range result.Closed {
+					s.SessionClosed(ctx, info)
+				}
 			}
 			if result.Data != nil && s.HandleData != nil {
 				if err := s.HandleData(ctx, *result.Data); err != nil {

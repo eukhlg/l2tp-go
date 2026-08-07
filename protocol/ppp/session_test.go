@@ -210,6 +210,32 @@ func TestSessionRejectsBadCredentials(t *testing.T) {
 	}
 }
 
+func TestMultiUserCredentialsAndAdmission(t *testing.T) {
+	credentials := map[string]string{"alice": "one", "bob": "two"}
+	if !Credentials(credentials)("alice", "one") || !Credentials(credentials)("bob", "two") || Credentials(credentials)("alice", "two") {
+		t.Fatal("multi-user credential lookup failed")
+	}
+	password, ok := Passwords(credentials)("DOMAIN\\bob")
+	if !ok || password != "two" {
+		t.Fatalf("password=%q ok=%t", password, ok)
+	}
+	session, err := NewSession(SessionConfig{
+		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
+		Authenticate: Credentials(credentials), Authorize: func(username string) bool { return username != "bob" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.Phase = PhaseAuthenticate
+	data := append([]byte{3}, []byte("bob")...)
+	data = append(data, 3)
+	data = append(data, []byte("two")...)
+	result := handleControl(t, session, ProtocolPAP, ControlPacket{Code: 1, Identifier: 1, Data: data})
+	if session.Phase != PhaseClosed || decodeControl(t, result.Frames[0]).Code != 3 {
+		t.Fatalf("phase=%s result=%#v", session.Phase, result)
+	}
+}
+
 func TestIPCPRejectsUnknownOption(t *testing.T) {
 	session, _ := NewSession(SessionConfig{ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"), Authenticate: StaticCredentials("u", "p")})
 	session.Phase = PhaseIPCP
