@@ -2,9 +2,71 @@ package ppp
 
 import (
 	"bytes"
+	"encoding/hex"
 	"net/netip"
 	"testing"
 )
+
+func TestSessionMSCHAPv2Authentication(t *testing.T) {
+	authChallenge, _ := hex.DecodeString("5B5D7C7D7B3F2F3E3C2C602132262628")
+	peerChallenge, _ := hex.DecodeString("21402324255E262A28295F2B3A337C7E")
+	session, err := NewSession(SessionConfig{
+		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
+		Authentication: AuthenticationMSCHAPv2, LookupPassword: StaticPassword("User", "clientPass"), ChallengeSource: bytes.NewReader(authChallenge),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := session.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lcpRequest := decodeControl(t, start[0])
+	options, err := DecodeOptions(lcpRequest.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(options) != 2 || !bytes.Equal(options[1].Value, []byte{0xc2, 0x23, 0x81}) {
+		t.Fatalf("authentication option=%x", options[1].Value)
+	}
+	peerOptions, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}})
+	handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 7, Data: peerOptions})
+	result := handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureAck, Identifier: lcpRequest.Identifier, Data: lcpRequest.Data})
+	if session.Phase != PhaseAuthenticate || len(result.Frames) != 1 {
+		t.Fatalf("phase=%d frames=%d", session.Phase, len(result.Frames))
+	}
+	challenge := decodeControl(t, result.Frames[0])
+	if challenge.Code != 1 || !bytes.Equal(challenge.Data[1:], authChallenge) {
+		t.Fatalf("challenge=%#v", challenge)
+	}
+
+	ntResponse := GenerateNTResponse(authChallenge, peerChallenge, "DOMAIN\\User", "clientPass")
+	responseValue := append([]byte{}, peerChallenge...)
+	responseValue = append(responseValue, make([]byte, 8)...)
+	responseValue = append(responseValue, ntResponse[:]...)
+	responseValue = append(responseValue, 0)
+	responseData := append([]byte{49}, responseValue...)
+	responseData = append(responseData, []byte("DOMAIN\\User")...)
+	result = handleControl(t, session, ProtocolCHAP, ControlPacket{Code: 2, Identifier: challenge.Identifier, Data: responseData})
+	if session.Phase != PhaseIPCP || len(result.Frames) != 2 {
+		t.Fatalf("phase=%d frames=%d", session.Phase, len(result.Frames))
+	}
+	success := decodeControl(t, result.Frames[0])
+	if success.Code != 3 || !bytes.Contains(success.Data, []byte("S=407A5589115FD0D6209F510FE9C04566932CDA56")) {
+		t.Fatalf("success=%s", success.Data)
+	}
+}
+
+func TestSessionMSCHAPv2RejectsWrongResponse(t *testing.T) {
+	session, _ := NewSession(SessionConfig{ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"), Authentication: AuthenticationMSCHAPv2, LookupPassword: StaticPassword("user", "password"), ChallengeSource: bytes.NewReader(make([]byte, 16))})
+	session.Phase, session.authIdentifier = PhaseAuthenticate, 1
+	data := append([]byte{49}, make([]byte, 49)...)
+	data = append(data, []byte("user")...)
+	result := handleControl(t, session, ProtocolCHAP, ControlPacket{Code: 2, Identifier: 1, Data: data})
+	if session.Phase != PhaseClosed || decodeControl(t, result.Frames[0]).Code != 4 {
+		t.Fatalf("phase=%d result=%#v", session.Phase, result)
+	}
+}
 
 func TestSessionLCPPAPIPCPAndIPv4(t *testing.T) {
 	session, err := NewSession(SessionConfig{

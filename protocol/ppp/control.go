@@ -11,6 +11,7 @@ const (
 	ProtocolIPCP uint16 = 0x8021
 	ProtocolLCP  uint16 = 0xc021
 	ProtocolPAP  uint16 = 0xc023
+	ProtocolCHAP uint16 = 0xc223
 )
 
 type Code uint8
