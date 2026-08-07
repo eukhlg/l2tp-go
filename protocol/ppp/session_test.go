@@ -94,6 +94,42 @@ func TestSessionMSCHAPv2RepeatsChallengeAfterLateLCPRequest(t *testing.T) {
 	}
 }
 
+func TestSessionMSCHAPv2InitialNegotiationSendsOneChallenge(t *testing.T) {
+	session, _ := NewSession(SessionConfig{
+		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
+		Authentication: AuthenticationMSCHAPv2, LookupPassword: StaticPassword("user", "password"), ChallengeSource: bytes.NewReader(make([]byte, 16)),
+	})
+	start, _ := session.Start()
+	localRequest := decodeControl(t, start[0])
+	peerOptions, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}})
+	handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 1, Data: peerOptions})
+	result := handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureAck, Identifier: localRequest.Identifier, Data: localRequest.Data})
+	if len(result.Frames) != 1 {
+		t.Fatalf("frames=%d, want one challenge", len(result.Frames))
+	}
+	if challenge := decodeControl(t, result.Frames[0]); challenge.Code != 1 || challenge.Identifier != 1 {
+		t.Fatalf("challenge=%#v", challenge)
+	}
+}
+
+func TestSessionRejectsUnsupportedIPv6CP(t *testing.T) {
+	session, _ := NewSession(SessionConfig{ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"), Authenticate: StaticCredentials("u", "p")})
+	session.Phase = PhaseOpen
+	payload := []byte{1, 7, 0, 14, 1, 10, 0, 1, 2, 3, 4, 5, 6, 7}
+	result, err := session.Handle(Frame{Protocol: 0x8057, Payload: payload})
+	if err != nil || len(result.Frames) != 1 {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if result.Frames[0].Protocol != ProtocolLCP {
+		t.Fatalf("protocol=%#x", result.Frames[0].Protocol)
+	}
+	reject := decodeControl(t, result.Frames[0])
+	wantData := append([]byte{0x80, 0x57}, payload...)
+	if reject.Code != ProtocolReject || !bytes.Equal(reject.Data, wantData) {
+		t.Fatalf("reject=%#v", reject)
+	}
+}
+
 func TestSessionLCPPAPIPCPAndIPv4(t *testing.T) {
 	session, err := NewSession(SessionConfig{
 		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
