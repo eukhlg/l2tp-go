@@ -2,10 +2,12 @@ package ppp
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 )
 
@@ -27,18 +29,40 @@ var (
 
 type Authenticator func(username, password string) bool
 
+type AuthenticationMethod string
+
+const (
+	AuthenticationPAP      AuthenticationMethod = "pap"
+	AuthenticationMSCHAPv2 AuthenticationMethod = "mschapv2"
+)
+
+type PasswordLookup func(username string) (password string, ok bool)
+
 func StaticCredentials(username, password string) Authenticator {
 	return func(gotUser, gotPassword string) bool {
 		return subtle.ConstantTimeCompare([]byte(username), []byte(gotUser)) == 1 && subtle.ConstantTimeCompare([]byte(password), []byte(gotPassword)) == 1
 	}
 }
 
+func StaticPassword(username, password string) PasswordLookup {
+	return func(gotUsername string) (string, bool) {
+		gotUsername = bareUsername(gotUsername)
+		if subtle.ConstantTimeCompare([]byte(username), []byte(gotUsername)) != 1 {
+			return "", false
+		}
+		return password, true
+	}
+}
+
 type SessionConfig struct {
-	ServerAddress netip.Addr
-	ClientAddress netip.Addr
-	PrimaryDNS    netip.Addr
-	SecondaryDNS  netip.Addr
-	Authenticate  Authenticator
+	ServerAddress   netip.Addr
+	ClientAddress   netip.Addr
+	PrimaryDNS      netip.Addr
+	SecondaryDNS    netip.Addr
+	Authenticate    Authenticator
+	Authentication  AuthenticationMethod
+	LookupPassword  PasswordLookup
+	ChallengeSource io.Reader
 }
 
 type SessionResult struct {
@@ -55,20 +79,41 @@ type Session struct {
 	ipcpLocalAcked  bool
 	lcpRequest      []byte
 	ipcpRequestData []byte
+	authChallenge   [16]byte
+	authIdentifier  uint8
 }
 
 func NewSession(config SessionConfig) (*Session, error) {
 	if !config.ServerAddress.Is4() || !config.ClientAddress.Is4() {
 		return nil, errors.New("ppp: server and client IPv4 addresses are required")
 	}
-	if config.Authenticate == nil {
-		return nil, errors.New("ppp: authenticator is required")
+	if config.Authentication == "" {
+		config.Authentication = AuthenticationPAP
+	}
+	switch config.Authentication {
+	case AuthenticationPAP:
+		if config.Authenticate == nil {
+			return nil, errors.New("ppp: PAP authenticator is required")
+		}
+	case AuthenticationMSCHAPv2:
+		if config.LookupPassword == nil {
+			return nil, errors.New("ppp: MS-CHAPv2 password lookup is required")
+		}
+		if config.ChallengeSource == nil {
+			config.ChallengeSource = rand.Reader
+		}
+	default:
+		return nil, fmt.Errorf("ppp: unsupported authentication method %q", config.Authentication)
 	}
 	return &Session{config: config, Phase: PhaseLCP}, nil
 }
 
 func (s *Session) Start() ([]Frame, error) {
-	data, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}}, Option{Type: 3, Value: []byte{0xc0, 0x23}})
+	authValue := []byte{0xc0, 0x23}
+	if s.config.Authentication == AuthenticationMSCHAPv2 {
+		authValue = []byte{0xc2, 0x23, 0x81}
+	}
+	data, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}}, Option{Type: 3, Value: authValue})
 	s.lcpRequest = append([]byte(nil), data...)
 	return controlFrames(ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 1, Data: data})
 }
@@ -78,10 +123,15 @@ func (s *Session) Handle(frame Frame) (SessionResult, error) {
 	case ProtocolLCP:
 		return s.handleLCP(frame.Payload)
 	case ProtocolPAP:
-		if s.Phase != PhaseAuthenticate {
+		if s.Phase != PhaseAuthenticate || s.config.Authentication != AuthenticationPAP {
 			return SessionResult{}, ErrUnexpectedProtocol
 		}
 		return s.handlePAP(frame.Payload)
+	case ProtocolCHAP:
+		if s.Phase != PhaseAuthenticate || s.config.Authentication != AuthenticationMSCHAPv2 {
+			return SessionResult{}, ErrUnexpectedProtocol
+		}
+		return s.handleMSCHAPv2(frame.Payload)
 	case ProtocolIPCP:
 		if s.Phase != PhaseIPCP && s.Phase != PhaseOpen {
 			return SessionResult{}, ErrUnexpectedProtocol
@@ -136,14 +186,72 @@ func (s *Session) handleLCP(payload []byte) (SessionResult, error) {
 		s.Phase = PhaseClosed
 		reply = &ControlPacket{Code: TerminateAck, Identifier: packet.Identifier, Data: packet.Data}
 	}
+	phaseBefore := s.Phase
 	if s.lcpPeerAcked && s.lcpLocalAcked && s.Phase == PhaseLCP {
 		s.Phase = PhaseAuthenticate
 	}
-	if reply == nil {
-		return SessionResult{}, nil
+	var frames []Frame
+	if reply != nil {
+		encoded, err := controlFrames(ProtocolLCP, *reply)
+		if err != nil {
+			return SessionResult{}, err
+		}
+		frames = append(frames, encoded...)
 	}
-	frames, err := controlFrames(ProtocolLCP, *reply)
-	return SessionResult{Frames: frames}, err
+	if phaseBefore != PhaseAuthenticate && s.Phase == PhaseAuthenticate && s.config.Authentication == AuthenticationMSCHAPv2 {
+		challenge, err := s.mschapv2Challenge()
+		if err != nil {
+			return SessionResult{}, err
+		}
+		frames = append(frames, challenge...)
+	}
+	return SessionResult{Frames: frames}, nil
+}
+
+func (s *Session) mschapv2Challenge() ([]Frame, error) {
+	if _, err := io.ReadFull(s.config.ChallengeSource, s.authChallenge[:]); err != nil {
+		return nil, fmt.Errorf("ppp: generate MS-CHAPv2 challenge: %w", err)
+	}
+	s.authIdentifier++
+	data := append([]byte{16}, s.authChallenge[:]...)
+	return controlFrames(ProtocolCHAP, ControlPacket{Code: 1, Identifier: s.authIdentifier, Data: data})
+}
+
+func (s *Session) handleMSCHAPv2(payload []byte) (SessionResult, error) {
+	packet, err := DecodeControlPacket(payload)
+	if err != nil {
+		return SessionResult{}, err
+	}
+	if packet.Code != 2 || packet.Identifier != s.authIdentifier || len(packet.Data) < 50 || packet.Data[0] != 49 {
+		return SessionResult{}, ErrUnexpectedProtocol
+	}
+	value := packet.Data[1:50]
+	if !bytes.Equal(value[16:24], make([]byte, 8)) || value[48] != 0 {
+		return SessionResult{}, errors.New("ppp: malformed MS-CHAPv2 response")
+	}
+	username := string(packet.Data[50:])
+	password, ok := s.config.LookupPassword(username)
+	var peerChallenge [16]byte
+	copy(peerChallenge[:], value[:16])
+	var response [24]byte
+	copy(response[:], value[24:48])
+	if !ok || !VerifyNTResponse(response, s.authChallenge[:], peerChallenge[:], username, password) {
+		message := fmt.Sprintf("E=691 R=0 C=%X V=3 M=Authentication failed", s.authChallenge)
+		frames, encodeErr := controlFrames(ProtocolCHAP, ControlPacket{Code: 4, Identifier: packet.Identifier, Data: []byte(message)})
+		if encodeErr != nil {
+			return SessionResult{}, encodeErr
+		}
+		s.Phase = PhaseClosed
+		return SessionResult{Frames: frames}, nil
+	}
+	authenticator := GenerateAuthenticatorResponse(password, response, peerChallenge[:], s.authChallenge[:], username)
+	s.Phase = PhaseIPCP
+	success, err := controlFrames(ProtocolCHAP, ControlPacket{Code: 3, Identifier: packet.Identifier, Data: []byte(authenticator + " M=Welcome")})
+	if err != nil {
+		return SessionResult{}, err
+	}
+	request, err := s.ipcpRequest()
+	return SessionResult{Frames: append(success, request...)}, err
 }
 
 func (s *Session) handlePAP(payload []byte) (SessionResult, error) {
