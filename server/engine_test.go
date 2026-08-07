@@ -36,7 +36,11 @@ func (p testPeer) Network() string { return "udp" }
 func (p testPeer) String() string  { return string(p) }
 
 func TestEngineTunnelSessionAndData(t *testing.T) {
-	engine := NewEngine(Config{HostName: "server", FirstTunnelID: 100, FirstSessionID: 200, ReceiveWindow: 4, PPP: &ppp.SessionConfig{
+	pool, err := NewAddressPool(netip.MustParsePrefix("10.0.0.0/24"), netip.MustParseAddr("10.0.0.2"), netip.MustParseAddr("10.0.0.3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := NewEngine(Config{HostName: "server", FirstTunnelID: 100, FirstSessionID: 200, ReceiveWindow: 4, AddressPool: pool, MaxSessionsPerTunnel: 1, MaxSessionsPerUser: 1, PPP: &ppp.SessionConfig{
 		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
 		PrimaryDNS: netip.MustParseAddr("1.1.1.1"), Authenticate: ppp.StaticCredentials("alice", "secret"),
 	}})
@@ -98,6 +102,18 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 		t.Fatalf("session ID=%d err=%v", serverSessionID, err)
 	}
 
+	wire, _ = client.Queue(l2tp.ControlMessage{Type: l2tp.ICRQ, AVPs: []l2tp.AVP{
+		l2tp.Uint16AVP(l2tp.AttrAssignedSessionID, 71, true),
+		l2tp.Uint32AVP(l2tp.AttrCallSerialNumber, 2, true),
+	}}, now)
+	result, err = engine.HandleDatagram(peer, wire, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rejected := receiveOne(t, client, result); rejected.Type != l2tp.CDN || rejected.SessionID != 71 {
+		t.Fatalf("session rejection=%#v", rejected)
+	}
+
 	wire, _ = client.Queue(l2tp.ControlMessage{Type: l2tp.ICCN, SessionID: serverSessionID}, now)
 	result, err = engine.HandleDatagram(peer, wire, now)
 	if err != nil {
@@ -136,6 +152,9 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 	if len(result.Replies) != 0 {
 		t.Fatalf("IPCP ACK replies=%d", len(result.Replies))
 	}
+	if result.Opened == nil || result.Opened.Address.String() != "10.0.0.2" {
+		t.Fatalf("opened=%#v", result.Opened)
+	}
 
 	ipv4 := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 2, 10, 0, 0, 1}
 	frameWire, err := (ppp.Frame{Protocol: 0x0021, Payload: ipv4}).MarshalBinary()
@@ -163,6 +182,13 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 	}
 	if outPacket.TunnelID != 50 || outPacket.SessionID != 70 {
 		t.Fatalf("outbound=%#v", outPacket)
+	}
+	if pool.InUse() != 1 || engine.userSessions["alice"] != 1 {
+		t.Fatalf("leases=%d users=%#v", pool.InUse(), engine.userSessions)
+	}
+	engine.removeTunnel(serverTunnelID)
+	if pool.InUse() != 0 || len(engine.userSessions) != 0 {
+		t.Fatalf("leases=%d users=%#v", pool.InUse(), engine.userSessions)
 	}
 }
 

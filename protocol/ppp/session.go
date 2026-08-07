@@ -46,6 +46,7 @@ const (
 )
 
 type PasswordLookup func(username string) (password string, ok bool)
+type Authorizer func(username string) bool
 
 func StaticCredentials(username, password string) Authenticator {
 	return func(gotUser, gotPassword string) bool {
@@ -63,6 +64,20 @@ func StaticPassword(username, password string) PasswordLookup {
 	}
 }
 
+func Passwords(credentials map[string]string) PasswordLookup {
+	return func(username string) (string, bool) {
+		password, ok := credentials[bareUsername(username)]
+		return password, ok
+	}
+}
+
+func Credentials(credentials map[string]string) Authenticator {
+	return func(username, password string) bool {
+		want, ok := credentials[bareUsername(username)]
+		return ok && subtle.ConstantTimeCompare([]byte(want), []byte(password)) == 1
+	}
+}
+
 type SessionConfig struct {
 	ServerAddress     netip.Addr
 	ClientAddress     netip.Addr
@@ -73,6 +88,7 @@ type SessionConfig struct {
 	Authentication    AuthenticationMethod
 	LookupPassword    PasswordLookup
 	ChallengeSource   io.Reader
+	Authorize         Authorizer
 }
 
 type SessionResult struct {
@@ -92,9 +108,12 @@ type Session struct {
 	authChallenge   [16]byte
 	authIdentifier  uint8
 	lcpIdentifier   uint8
+	username        string
 }
 
 func (s *Session) Authentication() AuthenticationMethod { return s.config.Authentication }
+func (s *Session) Username() string                     { return s.username }
+func (s *Session) ClientAddress() netip.Addr            { return s.config.ClientAddress }
 
 func NewSession(config SessionConfig) (*Session, error) {
 	if !config.ServerAddress.Is4() || !config.ClientAddress.Is4() {
@@ -292,7 +311,7 @@ func (s *Session) handleMSCHAPv2(payload []byte) (SessionResult, error) {
 	copy(peerChallenge[:], value[:16])
 	var response [24]byte
 	copy(response[:], value[24:48])
-	if !ok || !VerifyNTResponse(response, s.authChallenge[:], peerChallenge[:], username, password) {
+	if !ok || !VerifyNTResponse(response, s.authChallenge[:], peerChallenge[:], username, password) || (s.config.Authorize != nil && !s.config.Authorize(bareUsername(username))) {
 		message := fmt.Sprintf("E=691 R=0 C=%X V=3 M=Authentication failed", s.authChallenge)
 		frames, encodeErr := controlFrames(ProtocolCHAP, ControlPacket{Code: 4, Identifier: packet.Identifier, Data: []byte(message)})
 		if encodeErr != nil {
@@ -301,6 +320,7 @@ func (s *Session) handleMSCHAPv2(payload []byte) (SessionResult, error) {
 		s.Phase = PhaseClosed
 		return SessionResult{Frames: frames}, nil
 	}
+	s.username = bareUsername(username)
 	authenticator := GenerateAuthenticatorResponse(password, response, peerChallenge[:], s.authChallenge[:], username)
 	s.Phase = PhaseIPCP
 	success, err := controlFrames(ProtocolCHAP, ControlPacket{Code: 3, Identifier: packet.Identifier, Data: []byte(authenticator + " M=Welcome")})
@@ -323,7 +343,7 @@ func (s *Session) handlePAP(payload []byte) (SessionResult, error) {
 	if err != nil {
 		return SessionResult{}, err
 	}
-	if !s.config.Authenticate(username, password) {
+	if !s.config.Authenticate(username, password) || (s.config.Authorize != nil && !s.config.Authorize(bareUsername(username))) {
 		frames, encodeErr := controlFrames(ProtocolPAP, ControlPacket{Code: 3, Identifier: packet.Identifier, Data: papMessage("authentication failed")})
 		if encodeErr != nil {
 			return SessionResult{}, encodeErr
@@ -331,6 +351,7 @@ func (s *Session) handlePAP(payload []byte) (SessionResult, error) {
 		s.Phase = PhaseClosed
 		return SessionResult{Frames: frames}, nil
 	}
+	s.username = bareUsername(username)
 	s.Phase = PhaseIPCP
 	ack, err := controlFrames(ProtocolPAP, ControlPacket{Code: 2, Identifier: packet.Identifier, Data: papMessage("welcome")})
 	if err != nil {
