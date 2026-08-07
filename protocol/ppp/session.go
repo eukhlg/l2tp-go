@@ -223,6 +223,16 @@ func (s *Session) handleLCP(payload []byte) (SessionResult, error) {
 		}
 		frames = append(frames, encoded...)
 	}
+	// Windows can send Identification packets and one final LCP request after
+	// acknowledging our options. Repeat the active challenge after accepting
+	// that request so authentication is not lost during the handoff.
+	if packet.Code == ConfigureRequest && s.Phase == PhaseAuthenticate && s.config.Authentication == AuthenticationMSCHAPv2 {
+		challenge, err := s.currentMSCHAPv2Challenge()
+		if err != nil {
+			return SessionResult{}, err
+		}
+		frames = append(frames, challenge...)
+	}
 	if phaseBefore != PhaseAuthenticate && s.Phase == PhaseAuthenticate && s.config.Authentication == AuthenticationMSCHAPv2 {
 		challenge, err := s.mschapv2Challenge()
 		if err != nil {
@@ -238,6 +248,10 @@ func (s *Session) mschapv2Challenge() ([]Frame, error) {
 		return nil, fmt.Errorf("ppp: generate MS-CHAPv2 challenge: %w", err)
 	}
 	s.authIdentifier++
+	return s.currentMSCHAPv2Challenge()
+}
+
+func (s *Session) currentMSCHAPv2Challenge() ([]Frame, error) {
 	data := append([]byte{16}, s.authChallenge[:]...)
 	data = append(data, []byte(s.config.AuthenticatorName)...)
 	return controlFrames(ProtocolCHAP, ControlPacket{Code: 1, Identifier: s.authIdentifier, Data: data})

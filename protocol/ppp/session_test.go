@@ -68,6 +68,32 @@ func TestSessionMSCHAPv2RejectsWrongResponse(t *testing.T) {
 	}
 }
 
+func TestSessionMSCHAPv2RepeatsChallengeAfterLateLCPRequest(t *testing.T) {
+	challengeBytes := bytes.Repeat([]byte{0x5a}, 16)
+	session, err := NewSession(SessionConfig{
+		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
+		Authentication: AuthenticationMSCHAPv2, LookupPassword: StaticPassword("user", "password"), ChallengeSource: bytes.NewReader(challengeBytes), AuthenticatorName: "server",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, _ := session.Start()
+	localRequest := decodeControl(t, start[0])
+	peerOptions, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}})
+	handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 1, Data: peerOptions})
+	initial := handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureAck, Identifier: localRequest.Identifier, Data: localRequest.Data})
+	firstChallenge := decodeControl(t, initial.Frames[0])
+
+	late := handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 5, Data: peerOptions})
+	if len(late.Frames) != 2 || decodeControl(t, late.Frames[0]).Code != ConfigureAck {
+		t.Fatalf("late LCP responses=%#v", late.Frames)
+	}
+	repeated := decodeControl(t, late.Frames[1])
+	if repeated.Code != 1 || repeated.Identifier != firstChallenge.Identifier || !bytes.Equal(repeated.Data, firstChallenge.Data) {
+		t.Fatalf("repeated challenge=%#v first=%#v", repeated, firstChallenge)
+	}
+}
+
 func TestSessionLCPPAPIPCPAndIPv4(t *testing.T) {
 	session, err := NewSession(SessionConfig{
 		ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"),
