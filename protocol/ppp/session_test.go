@@ -85,8 +85,14 @@ func TestSessionLCPPAPIPCPAndIPv4(t *testing.T) {
 
 	peerOptions, _ := EncodeOptions(Option{Type: 1, Value: []byte{0x05, 0xdc}})
 	result := handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 9, Data: peerOptions})
+	if len(result.Frames) != 2 {
+		t.Fatalf("responses=%d, want ACK plus repeated request", len(result.Frames))
+	}
 	if got := decodeControl(t, result.Frames[0]); got.Code != ConfigureAck || !bytes.Equal(got.Data, peerOptions) {
 		t.Fatalf("ack=%#v", got)
+	}
+	if got := decodeControl(t, result.Frames[1]); got.Code != ConfigureRequest || !bytes.Equal(got.Data, localRequest.Data) {
+		t.Fatalf("repeated request=%#v", got)
 	}
 	handleControl(t, session, ProtocolLCP, ControlPacket{Code: ConfigureAck, Identifier: localRequest.Identifier, Data: localRequest.Data})
 	if session.Phase != PhaseAuthenticate {

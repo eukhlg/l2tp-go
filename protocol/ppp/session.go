@@ -209,6 +209,16 @@ func (s *Session) handleLCP(payload []byte) (SessionResult, error) {
 		}
 		frames = append(frames, encoded...)
 	}
+	// Some clients do not start receiving PPP until after they send their
+	// first LCP Configure-Request. Repeat our still-unacknowledged request at
+	// that point instead of leaving the session permanently in PhaseLCP.
+	if packet.Code == ConfigureRequest && !s.lcpLocalAcked {
+		encoded, err := controlFrames(ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 1, Data: s.lcpRequest})
+		if err != nil {
+			return SessionResult{}, err
+		}
+		frames = append(frames, encoded...)
+	}
 	if phaseBefore != PhaseAuthenticate && s.Phase == PhaseAuthenticate && s.config.Authentication == AuthenticationMSCHAPv2 {
 		challenge, err := s.mschapv2Challenge()
 		if err != nil {

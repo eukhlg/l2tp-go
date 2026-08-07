@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -240,6 +241,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	}
 	phaseBefore := pppSession.Phase
 	e.debugf("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
+	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
 	pppResult, err := pppSession.Handle(frame)
 	if err != nil {
 		e.debugf("ppp reject peer=%s tunnel=%d session=%d protocol=%#04x phase=%s error=%v", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, err)
@@ -256,6 +258,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 		}
 		result.Replies = append(result.Replies, wire)
 		e.debugf("ppp tx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, response.Protocol, pppSession.Phase, len(response.Payload))
+		e.debugPPPControl("tx", peer, packet.TunnelID, packet.SessionID, response)
 	}
 	if pppResult.IPv4 != nil {
 		e.debugf("ipv4 routed peer=%s tunnel=%d session=%d bytes=%d", peer, packet.TunnelID, packet.SessionID, len(pppResult.IPv4))
@@ -346,4 +349,29 @@ func (e *Engine) debugf(format string, args ...any) {
 	if e.config.Debugf != nil {
 		e.config.Debugf(format, args...)
 	}
+}
+
+func (e *Engine) debugPPPControl(direction string, peer net.Addr, tunnelID, sessionID uint16, frame ppp.Frame) {
+	if e.config.Debugf == nil || (frame.Protocol != ppp.ProtocolLCP && frame.Protocol != ppp.ProtocolIPCP && frame.Protocol != ppp.ProtocolCHAP) {
+		return
+	}
+	packet, err := ppp.DecodeControlPacket(frame.Payload)
+	if err != nil {
+		e.debugf("ppp control %s peer=%s tunnel=%d session=%d decode_error=%v", direction, peer, tunnelID, sessionID, err)
+		return
+	}
+	detail := fmt.Sprintf("data_bytes=%d", len(packet.Data))
+	if frame.Protocol != ppp.ProtocolCHAP && packet.Code >= ppp.ConfigureRequest && packet.Code <= ppp.ConfigureReject {
+		options, err := ppp.DecodeOptions(packet.Data)
+		if err != nil {
+			detail = fmt.Sprintf("options_error=%v", err)
+		} else {
+			parts := make([]string, 0, len(options))
+			for _, option := range options {
+				parts = append(parts, fmt.Sprintf("%d/%d", option.Type, len(option.Value)+2))
+			}
+			detail = "options=" + strings.Join(parts, ",")
+		}
+	}
+	e.debugf("ppp control %s peer=%s tunnel=%d session=%d protocol=%#04x code=%s id=%d %s", direction, peer, tunnelID, sessionID, frame.Protocol, packet.Code, packet.Identifier, detail)
 }

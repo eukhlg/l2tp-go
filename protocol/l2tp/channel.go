@@ -70,9 +70,9 @@ func (c *ControlChannel) Receive(wire []byte) (*ControlMessage, error) {
 	}
 	c.acknowledge(packet.Nr)
 	if len(packet.AVPs) == 0 {
-		if packet.Ns != c.nextReceive {
-			return nil, fmt.Errorf("%w: ZLB has Ns %d, want %d", ErrOutOfOrder, packet.Ns, c.nextReceive)
-		}
+		// A ZLB carries the sender's current Ns but does not consume a
+		// sequence number. UDP may deliver it before the control message
+		// whose Ns it reflects, so only use its Nr acknowledgement here.
 		return nil, nil
 	}
 	if packet.Ns != c.nextReceive {
