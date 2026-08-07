@@ -105,6 +105,24 @@ func TestZLBDoesNotConsumeSequenceNumber(t *testing.T) {
 	}
 }
 
+func TestZLBMayOvertakeSequencedMessage(t *testing.T) {
+	c := NewControlChannel(1, 1)
+	zlb, err := (Packet{Control: true, HasSequence: true, Ns: 3}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message, err := c.Receive(zlb); err != nil || message != nil {
+		t.Fatalf("message=%#v err=%v", message, err)
+	}
+	message, err := (ControlMessage{Type: Hello, Ns: 0}).MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c.Receive(message); err != nil || got == nil || got.Type != Hello {
+		t.Fatalf("message=%#v err=%v", got, err)
+	}
+}
+
 func TestControlChannelRetransmission(t *testing.T) {
 	start := time.Unix(100, 0)
 	c := NewControlChannel(1, 1)

@@ -16,6 +16,29 @@ const (
 
 type Code uint8
 
+func (c Code) String() string {
+	switch c {
+	case ConfigureRequest:
+		return "Configure-Request"
+	case ConfigureAck:
+		return "Configure-Ack"
+	case ConfigureNak:
+		return "Configure-Nak"
+	case ConfigureReject:
+		return "Configure-Reject"
+	case TerminateRequest:
+		return "Terminate-Request"
+	case TerminateAck:
+		return "Terminate-Ack"
+	case EchoRequest:
+		return "Echo-Request"
+	case EchoReply:
+		return "Echo-Reply"
+	default:
+		return fmt.Sprintf("Code(%d)", c)
+	}
+}
+
 const (
 	ConfigureRequest Code = 1
 	ConfigureAck     Code = 2

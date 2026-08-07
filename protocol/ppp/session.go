@@ -13,6 +13,15 @@ import (
 
 type Phase uint8
 
+func (p Phase) String() string {
+	if int(p) < len(phaseNames) {
+		return phaseNames[p]
+	}
+	return fmt.Sprintf("Phase(%d)", p)
+}
+
+var phaseNames = [...]string{"lcp", "authenticate", "ipcp", "open", "closed"}
+
 const (
 	PhaseLCP Phase = iota
 	PhaseAuthenticate
@@ -82,6 +91,8 @@ type Session struct {
 	authChallenge   [16]byte
 	authIdentifier  uint8
 }
+
+func (s *Session) Authentication() AuthenticationMethod { return s.config.Authentication }
 
 func NewSession(config SessionConfig) (*Session, error) {
 	if !config.ServerAddress.Is4() || !config.ClientAddress.Is4() {
@@ -193,6 +204,16 @@ func (s *Session) handleLCP(payload []byte) (SessionResult, error) {
 	var frames []Frame
 	if reply != nil {
 		encoded, err := controlFrames(ProtocolLCP, *reply)
+		if err != nil {
+			return SessionResult{}, err
+		}
+		frames = append(frames, encoded...)
+	}
+	// Some clients do not start receiving PPP until after they send their
+	// first LCP Configure-Request. Repeat our still-unacknowledged request at
+	// that point instead of leaving the session permanently in PhaseLCP.
+	if packet.Code == ConfigureRequest && !s.lcpLocalAcked {
+		encoded, err := controlFrames(ProtocolLCP, ControlPacket{Code: ConfigureRequest, Identifier: 1, Data: s.lcpRequest})
 		if err != nil {
 			return SessionResult{}, err
 		}

@@ -7,6 +7,15 @@ import (
 
 type TunnelState uint8
 
+func (s TunnelState) String() string {
+	if int(s) < len(tunnelStateNames) {
+		return tunnelStateNames[s]
+	}
+	return fmt.Sprintf("TunnelState(%d)", s)
+}
+
+var tunnelStateNames = [...]string{"idle", "wait-connect", "established", "closed"}
+
 const (
 	TunnelIdle TunnelState = iota
 	TunnelWaitConnect
@@ -15,6 +24,15 @@ const (
 )
 
 type SessionState uint8
+
+func (s SessionState) String() string {
+	if int(s) < len(sessionStateNames) {
+		return sessionStateNames[s]
+	}
+	return fmt.Sprintf("SessionState(%d)", s)
+}
+
+var sessionStateNames = [...]string{"wait-connect", "established"}
 
 const (
 	SessionWaitConnect SessionState = iota
