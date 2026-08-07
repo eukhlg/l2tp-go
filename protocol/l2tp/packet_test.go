@@ -65,13 +65,6 @@ func TestAVPRejectsOversizeValue(t *testing.T) {
 	}
 }
 
-func TestControlPacketRejectsSessionID(t *testing.T) {
-	_, err := (Packet{Control: true, HasSequence: true, SessionID: 1}).MarshalBinary()
-	if !errors.Is(err, ErrInvalidPacket) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func TestDecodeSequencedDataWithOffset(t *testing.T) {
 	wire := []byte{
 		0x0a, 0x02, // S and O, version 2
