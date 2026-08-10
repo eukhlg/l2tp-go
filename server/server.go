@@ -72,7 +72,7 @@ func (s *Server) Serve(ctx context.Context) error {
 				if _, err := s.Conn.WriteTo(reply, peer); err != nil {
 					return err
 				}
-				s.Engine.debugf("udp tx peer=%s bytes=%d", peer, len(reply))
+				s.Engine.tracef("udp tx peer=%s bytes=%d", peer, len(reply))
 			}
 			if result.Opened != nil && s.SessionOpened != nil {
 				info := *result.Opened

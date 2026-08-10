@@ -15,15 +15,21 @@ import (
 )
 
 func TestEngineDebugTraceMalformedDatagram(t *testing.T) {
-	var logs []string
-	engine := NewEngine(Config{Debugf: func(format string, args ...any) { logs = append(logs, fmt.Sprintf(format, args...)) }})
+	var debugLogs, traceLogs []string
+	engine := NewEngine(Config{
+		Debugf: func(format string, args ...any) { debugLogs = append(debugLogs, fmt.Sprintf(format, args...)) },
+		Tracef: func(format string, args ...any) { traceLogs = append(traceLogs, fmt.Sprintf(format, args...)) },
+	})
 	if _, err := engine.HandleDatagram(testPeer("peer"), []byte{1}, time.Time{}); err == nil {
 		t.Fatal("malformed datagram accepted")
 	}
-	if len(logs) != 2 || !strings.Contains(logs[0], "udp rx") || !strings.Contains(logs[1], "decode_error") {
-		t.Fatalf("logs=%q", logs)
+	if len(debugLogs) != 1 || !strings.Contains(debugLogs[0], "decode_error") {
+		t.Fatalf("debug logs=%q", debugLogs)
 	}
-	for _, entry := range logs {
+	if len(traceLogs) != 1 || !strings.Contains(traceLogs[0], "udp rx") {
+		t.Fatalf("trace logs=%q", traceLogs)
+	}
+	for _, entry := range append(debugLogs, traceLogs...) {
 		if strings.Contains(entry, "010203") {
 			t.Fatalf("payload leaked: %s", entry)
 		}

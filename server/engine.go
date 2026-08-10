@@ -35,6 +35,7 @@ type Config struct {
 	MaxSessionsPerTunnel int
 	MaxSessionsPerUser   int
 	Debugf               func(format string, args ...any)
+	Tracef               func(format string, args ...any)
 }
 
 type DataFrame struct {
@@ -101,13 +102,13 @@ func NewEngine(config Config) *Engine {
 func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Result, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.debugf("udp rx peer=%s bytes=%d", peer, len(wire))
+	e.tracef("udp rx peer=%s bytes=%d", peer, len(wire))
 	packet, err := l2tp.DecodePacket(wire)
 	if err != nil {
 		e.debugf("udp drop peer=%s decode_error=%v", peer, err)
 		return Result{}, err
 	}
-	e.debugf("l2tp rx peer=%s control=%t tunnel=%d session=%d ns=%d nr=%d payload_bytes=%d avps=%d", peer, packet.Control, packet.TunnelID, packet.SessionID, packet.Ns, packet.Nr, len(packet.Payload), len(packet.AVPs))
+	e.tracef("l2tp rx peer=%s control=%t tunnel=%d session=%d ns=%d nr=%d payload_bytes=%d avps=%d", peer, packet.Control, packet.TunnelID, packet.SessionID, packet.Ns, packet.Nr, len(packet.Payload), len(packet.AVPs))
 	if packet.Control {
 		return e.handleControl(peer, packet, wire, now)
 	}
@@ -345,7 +346,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	}
 	pppSession := sessionRuntime.ppp
 	phaseBefore := pppSession.Phase
-	e.debugf("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
+	e.tracef("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
 	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
 	pppResult, err := pppSession.Handle(frame)
 	if err != nil {
@@ -372,11 +373,11 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 			return Result{}, err
 		}
 		result.Replies = append(result.Replies, wire)
-		e.debugf("ppp tx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, response.Protocol, pppSession.Phase, len(response.Payload))
+		e.tracef("ppp tx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, response.Protocol, pppSession.Phase, len(response.Payload))
 		e.debugPPPControl("tx", peer, packet.TunnelID, packet.SessionID, response)
 	}
 	if pppResult.IPv4 != nil {
-		e.debugf("ipv4 routed peer=%s tunnel=%d session=%d bytes=%d", peer, packet.TunnelID, packet.SessionID, len(pppResult.IPv4))
+		e.tracef("ipv4 routed peer=%s tunnel=%d session=%d bytes=%d", peer, packet.TunnelID, packet.SessionID, len(pppResult.IPv4))
 		data.IPv4 = pppResult.IPv4
 		result.Data = data
 	}
@@ -522,6 +523,12 @@ func peerKey(addr net.Addr) string {
 func (e *Engine) debugf(format string, args ...any) {
 	if e.config.Debugf != nil {
 		e.config.Debugf(format, args...)
+	}
+}
+
+func (e *Engine) tracef(format string, args ...any) {
+	if e.config.Tracef != nil {
+		e.config.Tracef(format, args...)
 	}
 }
 
