@@ -99,3 +99,11 @@ func TestServerTunnelAcceptsSCCRQWithoutOptionalBearerCapabilities(t *testing.T)
 		t.Fatalf("reply=%#v state=%d err=%v", reply, tunnel.State, err)
 	}
 }
+
+func TestServerTunnelAcceptsCDNAfterPPPTermination(t *testing.T) {
+	tunnel := NewServerTunnel(ServerTunnelConfig{LocalTunnelID: 1})
+	tunnel.State = TunnelEstablished
+	if _, err := tunnel.Handle(ControlMessage{Type: CDN, TunnelID: 1, SessionID: 99}); err != nil {
+		t.Fatalf("idempotent CDN rejected: %v", err)
+	}
+}

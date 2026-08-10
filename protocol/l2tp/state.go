@@ -110,9 +110,12 @@ func (t *ServerTunnel) Handle(message ControlMessage) (*ControlMessage, error) {
 		session.State = SessionEstablished
 		return nil, nil
 	case CDN:
-		if _, ok := t.sessions[message.SessionID]; !ok {
-			return nil, ErrUnknownSession
+		if t.State != TunnelEstablished || message.TunnelID != t.LocalTunnelID {
+			return nil, t.unexpected(message)
 		}
+		// PPP termination may release the local session before the peer's
+		// CDN arrives. Treat CDN as idempotent so teardown can still be
+		// acknowledged and completed cleanly.
 		delete(t.sessions, message.SessionID)
 		return nil, nil
 	case StopCCN:

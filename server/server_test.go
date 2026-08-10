@@ -70,3 +70,16 @@ func TestServerLoopbackHandshake(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestTeardownControlDatagramClassification(t *testing.T) {
+	for _, kind := range []l2tp.MessageType{l2tp.CDN, l2tp.StopCCN} {
+		wire, err := (l2tp.ControlMessage{Type: kind, TunnelID: 1, SessionID: 1}).MarshalBinary()
+		if err != nil || !isTeardownControlDatagram(wire) {
+			t.Fatalf("type=%s classified=false err=%v", kind, err)
+		}
+	}
+	wire, err := (l2tp.ControlMessage{Type: l2tp.Hello, TunnelID: 1}).MarshalBinary()
+	if err != nil || isTeardownControlDatagram(wire) {
+		t.Fatalf("Hello classified as teardown: err=%v", err)
+	}
+}

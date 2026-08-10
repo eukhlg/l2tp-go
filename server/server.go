@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net"
 	"time"
+
+	"l2tp-go/protocol/l2tp"
 )
 
 type DataHandler func(context.Context, DataFrame) error
@@ -65,6 +67,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		} else {
 			result, handleErr := s.Engine.HandleDatagram(peer, buffer[:n], time.Now())
 			if handleErr != nil {
+				if errors.Is(handleErr, ErrUnknownTunnel) && isTeardownControlDatagram(buffer[:n]) {
+					s.Engine.tracef("stale teardown ignored peer=%s bytes=%d", peer, n)
+					continue
+				}
 				s.Engine.debugf("datagram rejected peer=%s error=%v", peer, handleErr)
 				continue
 			} // A malformed peer must not stop the listener.
@@ -123,6 +129,11 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func isTeardownControlDatagram(wire []byte) bool {
+	message, err := l2tp.DecodeControlMessage(wire)
+	return err == nil && (message.Type == l2tp.CDN || message.Type == l2tp.StopCCN)
 }
 
 func (s *Server) gracefulShutdown(ctx context.Context) error {
