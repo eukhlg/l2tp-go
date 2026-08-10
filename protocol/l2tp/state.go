@@ -165,9 +165,6 @@ func (t *ServerTunnel) handleSCCRQ(message ControlMessage) (*ControlMessage, err
 	if _, err := requiredUint32(message, AttrFramingCap); err != nil {
 		return nil, err
 	}
-	if _, err := requiredUint32(message, AttrBearerCap); err != nil {
-		return nil, err
-	}
 	if _, ok := message.Find(AttrHostName); !ok {
 		return nil, fmt.Errorf("%w: AVP %d", ErrMissingAttribute, AttrHostName)
 	}

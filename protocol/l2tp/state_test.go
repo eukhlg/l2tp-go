@@ -86,3 +86,16 @@ func TestServerTunnelRejectsBadTransitionsAndAttributes(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestServerTunnelAcceptsSCCRQWithoutOptionalBearerCapabilities(t *testing.T) {
+	tunnel := NewServerTunnel(ServerTunnelConfig{LocalTunnelID: 1, HostName: "server"})
+	reply, err := tunnel.Handle(ControlMessage{Type: SCCRQ, AVPs: []AVP{
+		Uint16AVP(AttrProtocolVersion, 0x0100, true),
+		Uint16AVP(AttrAssignedTunnelID, 2, true),
+		Uint32AVP(AttrFramingCap, 3, true),
+		StringAVP(AttrHostName, "macOS", true),
+	}})
+	if err != nil || reply == nil || reply.Type != SCCRP || tunnel.State != TunnelWaitConnect {
+		t.Fatalf("reply=%#v state=%d err=%v", reply, tunnel.State, err)
+	}
+}
