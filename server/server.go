@@ -82,6 +82,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			if result.Opened != nil && s.SessionOpened != nil {
 				info := *result.Opened
+				info.Protocol = "l2tp"
 				send := func(payload []byte) error {
 					packet, err := s.Engine.SendIPv4(info.TunnelID, info.SessionID, payload)
 					if err != nil {
@@ -96,6 +97,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			if s.SessionClosed != nil {
 				for _, info := range result.Closed {
+					info.Protocol = "l2tp"
 					s.SessionClosed(ctx, info)
 				}
 			}
@@ -149,6 +151,7 @@ func (s *Server) gracefulShutdown(ctx context.Context) error {
 	}
 	if s.SessionClosed != nil {
 		for _, info := range closed {
+			info.Protocol = "l2tp"
 			s.SessionClosed(ctx, info)
 		}
 	}

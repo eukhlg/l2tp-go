@@ -57,6 +57,9 @@ type SessionInfo struct {
 	TunnelID, SessionID uint16
 	Address             netip.Addr
 	Peer                net.Addr
+	Username            string
+	Protocol            string
+	Connected           bool
 }
 
 type Datagram struct {
@@ -69,6 +72,7 @@ type sessionRuntime struct {
 	address  netip.Addr
 	username string
 	admitted bool
+	opened   bool
 }
 
 type tunnelRuntime struct {
@@ -365,7 +369,8 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 		result.Closed = append(result.Closed, *closedInfo)
 	}
 	if phaseBefore != ppp.PhaseOpen && pppSession.Phase == ppp.PhaseOpen {
-		result.Opened = &SessionInfo{TunnelID: packet.TunnelID, SessionID: packet.SessionID, Address: sessionRuntime.address, Peer: peer}
+		sessionRuntime.opened = true
+		result.Opened = &SessionInfo{TunnelID: packet.TunnelID, SessionID: packet.SessionID, Address: sessionRuntime.address, Peer: peer, Username: sessionRuntime.username, Connected: true}
 	}
 	for _, response := range pppResult.Frames {
 		wire, err := encodeDataFrame(runtime, session, response)
@@ -510,7 +515,7 @@ func (e *Engine) releaseSession(runtime *tunnelRuntime, sessionID uint16) *Sessi
 	delete(runtime.sessions, sessionID)
 	runtime.state.RemoveSession(sessionID)
 	e.debugf("ppp released tunnel=%d session=%d address=%s user=%s", runtime.state.LocalTunnelID, sessionID, session.address, session.username)
-	return &SessionInfo{TunnelID: runtime.state.LocalTunnelID, SessionID: sessionID, Address: session.address, Peer: runtime.peer}
+	return &SessionInfo{TunnelID: runtime.state.LocalTunnelID, SessionID: sessionID, Address: session.address, Peer: runtime.peer, Username: session.username, Connected: session.opened}
 }
 
 func peerKey(addr net.Addr) string {

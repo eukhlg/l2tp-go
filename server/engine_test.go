@@ -158,7 +158,7 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 	if len(result.Replies) != 0 {
 		t.Fatalf("IPCP ACK replies=%d", len(result.Replies))
 	}
-	if result.Opened == nil || result.Opened.Address.String() != "10.0.0.2" {
+	if result.Opened == nil || result.Opened.Address.String() != "10.0.0.2" || result.Opened.Username != "alice" || !result.Opened.Connected {
 		t.Fatalf("opened=%#v", result.Opened)
 	}
 
