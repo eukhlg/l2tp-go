@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"l2tp-go/protocol/l2tp"
+	"github.com/eukhlg/l2tp-go/protocol/l2tp"
 )
 
 func TestServerLoopbackHandshake(t *testing.T) {
@@ -14,7 +14,11 @@ func TestServerLoopbackHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &Server{Conn: listener, Engine: NewEngine(Config{HostName: "server", FirstTunnelID: 10}), RetransmitTimeout: time.Second, MaxRetries: 2}
+	server, err := New(listener, Config{HostName: "server", FirstTunnelID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.MaxRetries = 2
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(ctx) }()
@@ -68,6 +72,36 @@ func TestServerLoopbackHandshake(t *testing.T) {
 	}
 	if err := server.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInjectedConstructorsRejectMissingDependencies(t *testing.T) {
+	if _, err := New(nil, Config{}); err == nil {
+		t.Fatal("L2TP server accepted a nil packet connection")
+	}
+	if _, err := NewIKEServer(nil, nil); err == nil {
+		t.Fatal("IKE server accepted missing dependencies")
+	}
+	if _, err := NewNATTServer(nil, nil, nil); err == nil {
+		t.Fatal("NAT-T server accepted missing dependencies")
+	}
+	if _, err := NewRawESPServer(nil, nil); err == nil {
+		t.Fatal("raw ESP server accepted missing dependencies")
+	}
+}
+
+func TestDispatchAnnotatesTransportAndPublishesClose(t *testing.T) {
+	engine := NewEngine(Config{})
+	service := &Server{Engine: engine}
+	var closed SessionInfo
+	service.SessionClosed = func(_ context.Context, info SessionInfo) { closed = info }
+	want := SessionInfo{TunnelID: 3, SessionID: 4, Username: "alice", Connected: true}
+	err := service.Dispatch(context.Background(), Result{Closed: []SessionInfo{want}}, "l2tp/ipsec", func(net.Addr, uint16, uint16, []byte) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if closed.Protocol != "l2tp/ipsec" || closed.Username != want.Username {
+		t.Fatalf("closed=%#v", closed)
 	}
 }
 

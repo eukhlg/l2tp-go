@@ -6,15 +6,19 @@ import (
 	"net"
 	"time"
 
-	"l2tp-go/protocol/l2tp"
+	"github.com/eukhlg/l2tp-go/protocol/l2tp"
 )
 
 type DataHandler func(context.Context, DataFrame) error
 
+// PacketWriter sends one raw IPv4 packet back to the PPP session associated
+// with an event. Embedders can retain it for the lifetime of that session.
+type PacketWriter func([]byte) error
+
 // IPv4Router accepts a packet from a client. The send callback may be used
 // synchronously to route zero or more return packets to that same PPP session.
-type IPv4Router func(context.Context, DataFrame, func([]byte) error) error
-type SessionOpenHandler func(context.Context, SessionInfo, func([]byte) error) error
+type IPv4Router func(context.Context, DataFrame, PacketWriter) error
+type SessionOpenHandler func(context.Context, SessionInfo, PacketWriter) error
 type SessionCloseHandler func(context.Context, SessionInfo)
 
 type Server struct {
@@ -33,6 +37,16 @@ func Listen(address string, config Config) (*Server, error) {
 	conn, err := net.ListenPacket("udp", address)
 	if err != nil {
 		return nil, err
+	}
+	return New(conn, config)
+}
+
+// New creates an L2TP server over a caller-owned packet connection. This is
+// the preferred constructor for embedding in another network service. Close
+// closes conn; callers that share a connection should pass a dedicated wrapper.
+func New(conn net.PacketConn, config Config) (*Server, error) {
+	if conn == nil {
+		return nil, errors.New("l2tp server: packet connection is required")
 	}
 	return &Server{Conn: conn, Engine: NewEngine(config), RetransmitTimeout: time.Second, MaxRetries: 5}, nil
 }
@@ -80,45 +94,12 @@ func (s *Server) Serve(ctx context.Context) error {
 				}
 				s.Engine.tracef("udp tx peer=%s bytes=%d", peer, len(reply))
 			}
-			if result.Opened != nil && s.SessionOpened != nil {
-				info := *result.Opened
-				info.Protocol = "l2tp"
-				send := func(payload []byte) error {
-					packet, err := s.Engine.SendIPv4(info.TunnelID, info.SessionID, payload)
-					if err != nil {
-						return err
-					}
-					_, err = s.Conn.WriteTo(packet.Payload, packet.Peer)
-					return err
-				}
-				if err := s.SessionOpened(ctx, info, send); err != nil {
-					return err
-				}
+			writer := func(peer net.Addr, tunnelID, sessionID uint16, payload []byte) error {
+				_, err := s.Conn.WriteTo(payload, peer)
+				return err
 			}
-			if s.SessionClosed != nil {
-				for _, info := range result.Closed {
-					info.Protocol = "l2tp"
-					s.SessionClosed(ctx, info)
-				}
-			}
-			if result.Data != nil && s.HandleData != nil {
-				if err := s.HandleData(ctx, *result.Data); err != nil {
-					return err
-				}
-			}
-			if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4 != nil {
-				frame := *result.Data
-				send := func(payload []byte) error {
-					packet, err := s.Engine.SendIPv4(frame.TunnelID, frame.Session.LocalID, payload)
-					if err != nil {
-						return err
-					}
-					_, err = s.Conn.WriteTo(packet.Payload, packet.Peer)
-					return err
-				}
-				if err := s.RouteIPv4(ctx, frame, send); err != nil {
-					return err
-				}
+			if err := s.Dispatch(ctx, result, "l2tp", writer); err != nil {
+				return err
 			}
 		}
 		packets, err := s.Engine.Retransmit(time.Now(), s.RetransmitTimeout, s.MaxRetries)
@@ -131,6 +112,54 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// SessionPacketWriter is the transport-specific final step used by Dispatch.
+// The engine has already selected the logical L2TP session; the implementation
+// only needs to wrap and transmit the resulting L2TP datagram.
+type SessionPacketWriter func(peer net.Addr, tunnelID, sessionID uint16, payload []byte) error
+
+// Dispatch publishes an engine result through the server callbacks. It is
+// shared by raw L2TP and protected L2TP/IPsec transports so embedders observe a
+// single session and raw-IPv4 API independent of the outer transport.
+func (s *Server) Dispatch(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
+	if s.Engine == nil || write == nil {
+		return errors.New("l2tp server: engine and packet writer are required")
+	}
+	newWriter := func(peer net.Addr, tunnelID, sessionID uint16) PacketWriter {
+		return func(payload []byte) error {
+			packet, err := s.Engine.SendIPv4(tunnelID, sessionID, payload)
+			if err != nil {
+				return err
+			}
+			return write(peer, tunnelID, sessionID, packet.Payload)
+		}
+	}
+	if result.Opened != nil && s.SessionOpened != nil {
+		info := *result.Opened
+		info.Protocol = protocol
+		if err := s.SessionOpened(ctx, info, newWriter(info.Peer, info.TunnelID, info.SessionID)); err != nil {
+			return err
+		}
+	}
+	if s.SessionClosed != nil {
+		for _, info := range result.Closed {
+			info.Protocol = protocol
+			s.SessionClosed(ctx, info)
+		}
+	}
+	if result.Data != nil && s.HandleData != nil {
+		if err := s.HandleData(ctx, *result.Data); err != nil {
+			return err
+		}
+	}
+	if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4 != nil {
+		frame := *result.Data
+		if err := s.RouteIPv4(ctx, frame, newWriter(frame.Peer, frame.TunnelID, frame.Session.LocalID)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func isTeardownControlDatagram(wire []byte) bool {

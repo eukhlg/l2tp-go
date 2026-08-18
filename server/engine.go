@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"l2tp-go/protocol/l2tp"
-	"l2tp-go/protocol/ppp"
+	"github.com/eukhlg/l2tp-go/protocol/l2tp"
+	"github.com/eukhlg/l2tp-go/protocol/ppp"
 )
 
 var (
