@@ -52,7 +52,8 @@ func New(conn net.PacketConn, config Config) (*Server, error) {
 }
 
 // Serve runs until the context is cancelled, the connection is closed, or a
-// data handler returns an error. The caller remains responsible for Close.
+// data handler returns an error. Tunnel-specific protocol failures are isolated
+// to the affected tunnel. The caller remains responsible for Close.
 func (s *Server) Serve(ctx context.Context) error {
 	if s.Conn == nil || s.Engine == nil {
 		return errors.New("l2tp server: Conn and Engine are required")
@@ -102,9 +103,15 @@ func (s *Server) Serve(ctx context.Context) error {
 				return err
 			}
 		}
-		packets, err := s.Engine.Retransmit(time.Now(), s.RetransmitTimeout, s.MaxRetries)
+		packets, closed, err := s.Engine.Retransmit(time.Now(), s.RetransmitTimeout, s.MaxRetries)
 		if err != nil {
 			return err
+		}
+		if s.SessionClosed != nil {
+			for _, info := range closed {
+				info.Protocol = "l2tp"
+				s.SessionClosed(ctx, info)
+			}
 		}
 		for _, packet := range packets {
 			if _, err := s.Conn.WriteTo(packet.Payload, packet.Peer); err != nil {

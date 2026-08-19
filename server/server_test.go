@@ -75,6 +75,87 @@ func TestServerLoopbackHandshake(t *testing.T) {
 	}
 }
 
+func TestServerSurvivesTunnelRetryExhaustion(t *testing.T) {
+	listener, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(listener, Config{HostName: "server", FirstTunnelID: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.RetransmitTimeout = 20 * time.Millisecond
+	server.MaxRetries = 0
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx) }()
+
+	request := func(tunnelID uint16) []byte {
+		t.Helper()
+		channel := l2tp.NewControlChannel(0, 1)
+		wire, queueErr := channel.Queue(l2tp.ControlMessage{Type: l2tp.SCCRQ, AVPs: []l2tp.AVP{
+			l2tp.Uint16AVP(l2tp.AttrProtocolVersion, 0x0100, true),
+			l2tp.Uint32AVP(l2tp.AttrFramingCap, 1, true),
+			l2tp.StringAVP(l2tp.AttrHostName, "client", true),
+			l2tp.Uint16AVP(l2tp.AttrAssignedTunnelID, tunnelID, true),
+		}}, time.Now())
+		if queueErr != nil {
+			t.Fatal(queueErr)
+		}
+		return wire
+	}
+
+	first, err := net.DialUDP("udp", nil, listener.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := first.Write(request(20)); err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 2048)
+	if err := first.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("server stopped after tunnel timeout: %v", err)
+	default:
+	}
+
+	second, err := net.DialUDP("udp", nil, listener.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if _, err := second.Write(request(21)); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Read(buffer); err != nil {
+		t.Fatalf("server did not accept a new tunnel after timeout: %v", err)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not stop after cancellation")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInjectedConstructorsRejectMissingDependencies(t *testing.T) {
 	if _, err := New(nil, Config{}); err == nil {
 		t.Fatal("L2TP server accepted a nil packet connection")

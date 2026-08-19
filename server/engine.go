@@ -421,20 +421,26 @@ func encodeDataFrame(runtime *tunnelRuntime, session l2tp.Session, frame ppp.Fra
 	return (l2tp.Packet{TunnelID: runtime.state.PeerTunnelID, SessionID: session.PeerID, Payload: frameWire}).MarshalBinary()
 }
 
-func (e *Engine) Retransmit(now time.Time, timeout time.Duration, maxRetries int) ([]Datagram, error) {
+func (e *Engine) Retransmit(now time.Time, timeout time.Duration, maxRetries int) ([]Datagram, []SessionInfo, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	var result []Datagram
-	for _, runtime := range e.tunnels {
+	var closed []SessionInfo
+	for id, runtime := range e.tunnels {
 		packets, err := runtime.channel.Retransmit(now, timeout, maxRetries)
 		if err != nil {
-			return nil, err
+			if errors.Is(err, l2tp.ErrRetryExhausted) {
+				closed = append(closed, e.removeTunnel(id)...)
+				e.debugf("tunnel closed peer=%s tunnel=%d error=%v", runtime.peer, id, err)
+				continue
+			}
+			return result, closed, err
 		}
 		for _, packet := range packets {
 			result = append(result, Datagram{Payload: packet, Peer: runtime.peer})
 		}
 	}
-	return result, nil
+	return result, closed, nil
 }
 
 // Shutdown creates a final StopCCN for every live tunnel and releases all
