@@ -3,6 +3,7 @@ package ppp
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"net/netip"
 	"testing"
 )
@@ -193,8 +194,12 @@ func TestSessionRejectsSpoofedIPv4Source(t *testing.T) {
 	session, _ := NewSession(SessionConfig{ServerAddress: netip.MustParseAddr("10.0.0.1"), ClientAddress: netip.MustParseAddr("10.0.0.2"), Authenticate: StaticCredentials("u", "p")})
 	session.Phase = PhaseOpen
 	packet := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 0, 0, 99, 10, 0, 0, 1}
-	if _, err := session.Handle(Frame{Protocol: ProtocolIPv4, Payload: packet}); err != ErrSourceAddress {
+	_, err := session.Handle(Frame{Protocol: ProtocolIPv4, Payload: packet})
+	if !errors.Is(err, ErrSourceAddress) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := err.Error(), "ppp: unexpected client source address: received=10.0.0.99 expected=10.0.0.2"; got != want {
+		t.Fatalf("error=%q want=%q", got, want)
 	}
 }
 

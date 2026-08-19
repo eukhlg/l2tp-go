@@ -455,7 +455,8 @@ func (s *Session) validateIPv4(packet []byte) error {
 		return ErrInvalidIPv4
 	}
 	if !bytes.Equal(packet[12:16], s.config.ClientAddress.AsSlice()) {
-		return ErrSourceAddress
+		received := netip.AddrFrom4([4]byte{packet[12], packet[13], packet[14], packet[15]})
+		return fmt.Errorf("%w: received=%s expected=%s", ErrSourceAddress, received, s.config.ClientAddress)
 	}
 	return nil
 }
