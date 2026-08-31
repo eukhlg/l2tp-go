@@ -469,6 +469,20 @@ func (e *Engine) Shutdown() ([]Datagram, []SessionInfo, error) {
 
 func (e *Engine) TunnelCount() int { e.mu.Lock(); defer e.mu.Unlock(); return len(e.tunnels) }
 
+// ClosePeer removes the tunnel associated with peer and releases all of its
+// local PPP resources. It is used when an enclosing transport has already
+// failed, so no L2TP teardown packet can be delivered reliably.
+func (e *Engine) ClosePeer(peer net.Addr) []SessionInfo {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	id, ok := e.tunnelByPeer[peerKey(peer)]
+	if !ok {
+		return nil
+	}
+	e.debugf("tunnel closed peer=%s tunnel=%d reason=transport-expired", peer, id)
+	return e.removeTunnel(id)
+}
+
 func (e *Engine) allocateTunnelID() uint16 {
 	for {
 		id := e.nextTunnelID
