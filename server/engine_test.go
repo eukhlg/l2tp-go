@@ -192,7 +192,10 @@ func TestEngineTunnelSessionAndData(t *testing.T) {
 	if pool.InUse() != 1 || engine.userSessions["alice"] != 1 {
 		t.Fatalf("leases=%d users=%#v", pool.InUse(), engine.userSessions)
 	}
-	engine.removeTunnel(serverTunnelID)
+	closed := engine.ClosePeer(peer)
+	if len(closed) != 1 || !closed[0].Connected || closed[0].Address.String() != "10.0.0.2" || engine.TunnelCount() != 0 {
+		t.Fatalf("closed=%#v tunnels=%d", closed, engine.TunnelCount())
+	}
 	if pool.InUse() != 0 || len(engine.userSessions) != 0 {
 		t.Fatalf("leases=%d users=%#v", pool.InUse(), engine.userSessions)
 	}
