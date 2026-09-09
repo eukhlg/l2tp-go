@@ -82,6 +82,10 @@ func (s *Server) Serve(ctx context.Context) error {
 		} else {
 			result, handleErr := s.Engine.HandleDatagram(peer, buffer[:n], time.Now())
 			if handleErr != nil {
+				if errors.Is(handleErr, ErrNewTunnelRateLimited) {
+					s.Engine.tracef("datagram rate limited peer=%s", peer)
+					continue
+				}
 				if errors.Is(handleErr, ErrUnknownTunnel) && isTeardownControlDatagram(buffer[:n]) {
 					s.Engine.tracef("stale teardown ignored peer=%s bytes=%d", peer, n)
 					continue

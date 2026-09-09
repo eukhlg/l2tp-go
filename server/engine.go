@@ -21,6 +21,7 @@ var (
 	ErrSessionNotEstablished = errors.New("l2tp server: session is not established")
 	ErrGlobalSessionLimit    = errors.New("l2tp server: global session limit reached")
 	ErrTunnelSessionLimit    = errors.New("l2tp server: tunnel session limit reached")
+	ErrNewTunnelRateLimited  = errors.New("l2tp server: new tunnel rate limited")
 )
 
 type Config struct {
@@ -34,6 +35,8 @@ type Config struct {
 	MaxSessions          int
 	MaxSessionsPerTunnel int
 	MaxSessionsPerUser   int
+	NewTunnelsPerSecond  float64
+	NewTunnelBurst       int
 	Debugf               func(format string, args ...any)
 	Tracef               func(format string, args ...any)
 }
@@ -90,6 +93,7 @@ type Engine struct {
 	tunnels      map[uint16]*tunnelRuntime
 	tunnelByPeer map[string]uint16
 	userSessions map[string]int
+	newTunnelRL  *newTunnelLimiter
 }
 
 func NewEngine(config Config) *Engine {
@@ -100,7 +104,15 @@ func NewEngine(config Config) *Engine {
 	if config.VendorName == "" {
 		config.VendorName = "l2tp-go"
 	}
-	return &Engine{config: config, nextTunnelID: first, tunnels: make(map[uint16]*tunnelRuntime), tunnelByPeer: make(map[string]uint16), userSessions: make(map[string]int)}
+	engine := &Engine{config: config, nextTunnelID: first, tunnels: make(map[uint16]*tunnelRuntime), tunnelByPeer: make(map[string]uint16), userSessions: make(map[string]int)}
+	if config.NewTunnelsPerSecond > 0 {
+		burst := config.NewTunnelBurst
+		if burst < 1 {
+			burst = 1
+		}
+		engine.newTunnelRL = newNewTunnelLimiter(config.NewTunnelsPerSecond, burst)
+	}
+	return engine
 }
 
 func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Result, error) {
@@ -120,7 +132,7 @@ func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Resu
 }
 
 func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, now time.Time) (Result, error) {
-	runtime, created, replaced, err := e.findControlTunnel(peer, packet, wire)
+	runtime, created, replaced, err := e.findControlTunnel(peer, packet, wire, now)
 	if err != nil {
 		return Result{}, err
 	}
@@ -266,7 +278,7 @@ func (e *Engine) queueCallRejection(runtime *tunnelRuntime, peerSessionID uint16
 	return Result{Replies: [][]byte{wire}}, nil
 }
 
-func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byte) (*tunnelRuntime, bool, []SessionInfo, error) {
+func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byte, now time.Time) (*tunnelRuntime, bool, []SessionInfo, error) {
 	if packet.TunnelID != 0 {
 		runtime, ok := e.tunnels[packet.TunnelID]
 		if !ok {
@@ -295,6 +307,16 @@ func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byt
 	if err != nil {
 		return nil, false, nil, err
 	}
+	existingID, hasExisting := e.tunnelByPeer[peerKey(peer)]
+	if hasExisting {
+		runtime := e.tunnels[existingID]
+		if runtime != nil && runtime.state.State != l2tp.TunnelEstablished && runtime.state.PeerTunnelID == peerID {
+			return runtime, false, nil, nil
+		}
+	}
+	if e.newTunnelRL != nil && !e.newTunnelRL.allow(sourceIP(peer), now) {
+		return nil, false, nil, ErrNewTunnelRateLimited
+	}
 	peerWindow := uint16(1)
 	if windowAVP, ok := message.Find(l2tp.AttrReceiveWindowSize); ok {
 		peerWindow, err = windowAVP.Uint16()
@@ -310,13 +332,9 @@ func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byt
 		return nil, false, nil, err
 	}
 	var replaced []SessionInfo
-	if id, ok := e.tunnelByPeer[peerKey(peer)]; ok {
-		runtime := e.tunnels[id]
-		if runtime != nil && runtime.state.State != l2tp.TunnelEstablished && runtime.state.PeerTunnelID == peerID {
-			return runtime, false, nil, nil
-		}
-		e.debugf("control restart peer=%s replacing_tunnel=%d", peer, id)
-		replaced = e.removeTunnel(id)
+	if hasExisting {
+		e.debugf("control restart peer=%s replacing_tunnel=%d", peer, existingID)
+		replaced = e.removeTunnel(existingID)
 	}
 	localID := e.allocateTunnelID()
 	state := l2tp.NewServerTunnel(l2tp.ServerTunnelConfig{LocalTunnelID: localID, FirstSessionID: e.config.FirstSessionID, HostName: e.config.HostName, VendorName: e.config.VendorName, ReceiveWindow: e.config.ReceiveWindow})
