@@ -35,5 +35,6 @@ The `protocol/l2tp`, `protocol/ppp`, and L2TP `server` package paths are retaine
 The old IPsec APIs under `server`, `protocol/isakmp`, and `protocol/esp` move to
 ipsec-go. The standalone application and its containers move to Overture VPN.
 
-Library releases use `v`-prefixed semantic versions. The first extracted release
-is planned as v0.3.0; old application tags are not republished as library tags.
+Library releases use `v`-prefixed semantic versions. The first extracted release is
+[v0.3.0](https://github.com/eukhlg/l2tp-go/releases/tag/v0.3.0); old application
+tags are not republished as library tags.
