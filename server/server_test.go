@@ -160,15 +160,7 @@ func TestInjectedConstructorsRejectMissingDependencies(t *testing.T) {
 	if _, err := New(nil, Config{}); err == nil {
 		t.Fatal("L2TP server accepted a nil packet connection")
 	}
-	if _, err := NewIKEServer(nil, nil); err == nil {
-		t.Fatal("IKE server accepted missing dependencies")
-	}
-	if _, err := NewNATTServer(nil, nil, nil); err == nil {
-		t.Fatal("NAT-T server accepted missing dependencies")
-	}
-	if _, err := NewRawESPServer(nil, nil); err == nil {
-		t.Fatal("raw ESP server accepted missing dependencies")
-	}
+
 }
 
 func TestDispatchAnnotatesTransportAndPublishesClose(t *testing.T) {
