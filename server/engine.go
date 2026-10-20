@@ -116,10 +116,23 @@ func NewEngine(config Config) *Engine {
 }
 
 func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Result, error) {
+	r, err := e.HandleDatagramBorrowed(peer, wire, now)
+	if r.Data != nil {
+		r.Data.PPP.Payload = append([]byte(nil), r.Data.PPP.Payload...)
+		if r.Data.IPv4 != nil {
+			r.Data.IPv4 = append([]byte(nil), r.Data.IPv4...)
+		}
+	}
+	return r, err
+}
+
+// HandleDatagramBorrowed borrows data packet payloads until the final consumer
+// returns. Callers retaining Result asynchronously must copy its data first.
+func (e *Engine) HandleDatagramBorrowed(peer net.Addr, wire []byte, now time.Time) (Result, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.tracef("udp rx peer=%s bytes=%d", peer, len(wire))
-	packet, err := l2tp.DecodePacket(wire)
+	packet, err := l2tp.DecodePacketView(wire)
 	if err != nil {
 		e.debugf("udp drop peer=%s decode_error=%v", peer, err)
 		return Result{}, err
@@ -356,7 +369,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	if !ok || session.State != l2tp.SessionEstablished {
 		return Result{}, ErrSessionNotEstablished
 	}
-	frame, err := ppp.DecodeFrame(packet.Payload)
+	frame, err := ppp.DecodeFrameView(packet.Payload)
 	if err != nil {
 		e.debugf("ppp drop peer=%s tunnel=%d session=%d decode_error=%v", peer, packet.TunnelID, packet.SessionID, err)
 		return Result{}, err
@@ -370,7 +383,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	phaseBefore := pppSession.Phase
 	e.tracef("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
 	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
-	pppResult, err := pppSession.Handle(frame)
+	pppResult, err := pppSession.HandleBorrowed(frame)
 	if err != nil {
 		e.debugf("ppp reject peer=%s tunnel=%d session=%d protocol=%#04x phase=%s error=%v", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, err)
 		return Result{}, err
@@ -429,6 +442,37 @@ func (e *Engine) SendIPv4(tunnelID, sessionID uint16, payload []byte) (Datagram,
 		return Datagram{}, err
 	}
 	return Datagram{Payload: wire, Peer: runtime.peer}, nil
+}
+
+// HeaderBuffer allows independent embedders to provide owned packet storage.
+type HeaderBuffer interface {
+	Prepend(int) ([]byte, error)
+	Len() int
+}
+
+// PrependIPv4 adds the uncompressed PPP and L2TP data headers in reserved space.
+func (e *Engine) PrependIPv4(tunnelID, sessionID uint16, buffer HeaderBuffer) (net.Addr, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	runtime, ok := e.tunnels[tunnelID]
+	if !ok {
+		return nil, ErrUnknownTunnel
+	}
+	session, ok := runtime.state.Session(sessionID)
+	if !ok || session.State != l2tp.SessionEstablished {
+		return nil, ErrSessionNotEstablished
+	}
+	sessionRuntime := runtime.sessions[sessionID]
+	if sessionRuntime == nil || sessionRuntime.ppp == nil || sessionRuntime.ppp.Phase != ppp.PhaseOpen {
+		return nil, ErrSessionNotEstablished
+	}
+	if err := ppp.PrependFrame(buffer, ppp.ProtocolIPv4); err != nil {
+		return nil, err
+	}
+	if err := l2tp.PrependData(buffer, runtime.state.PeerTunnelID, session.PeerID); err != nil {
+		return nil, err
+	}
+	return runtime.peer, nil
 }
 
 func encodeDataFrame(runtime *tunnelRuntime, session l2tp.Session, frame ppp.Frame) ([]byte, error) {

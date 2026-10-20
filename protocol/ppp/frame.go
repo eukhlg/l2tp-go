@@ -23,6 +23,15 @@ type Frame struct {
 // DecodeFrame accepts both address-and-control-field-compressed and protocol-
 // field-compressed frames, as negotiated by PPP.
 func DecodeFrame(b []byte) (Frame, error) {
+	p, err := DecodeFrameView(b)
+	if err == nil {
+		p.Payload = append([]byte(nil), p.Payload...)
+	}
+	return p, err
+}
+
+// DecodeFrameView borrows bounded payload slices for the lifetime of b.
+func DecodeFrameView(b []byte) (Frame, error) {
 	if len(b) >= 2 && b[0] == Address && b[1] == Control {
 		b = b[2:]
 	}
@@ -44,7 +53,7 @@ func DecodeFrame(b []byte) (Frame, error) {
 	if !validProtocol(protocol) {
 		return Frame{}, fmt.Errorf("ppp: invalid protocol %#x", protocol)
 	}
-	return Frame{Protocol: protocol, Payload: append([]byte(nil), b...)}, nil
+	return Frame{Protocol: protocol, Payload: b[:len(b):len(b)]}, nil
 }
 
 // MarshalBinary returns an uncompressed PPP frame without an FCS.

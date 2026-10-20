@@ -155,6 +155,16 @@ func (s *Session) Start() ([]Frame, error) {
 }
 
 func (s *Session) Handle(frame Frame) (SessionResult, error) {
+	r, err := s.HandleBorrowed(frame)
+	if r.IPv4 != nil {
+		r.IPv4 = append([]byte(nil), r.IPv4...)
+	}
+	return r, err
+}
+
+// HandleBorrowed returns an IPv4 view valid for the lifetime of frame.Payload.
+// Control processing retains its normal independent storage.
+func (s *Session) HandleBorrowed(frame Frame) (SessionResult, error) {
 	switch frame.Protocol {
 	case ProtocolLCP:
 		return s.handleLCP(frame.Payload)
@@ -180,7 +190,7 @@ func (s *Session) Handle(frame Frame) (SessionResult, error) {
 		if err := s.validateIPv4(frame.Payload); err != nil {
 			return SessionResult{}, err
 		}
-		return SessionResult{IPv4: append([]byte(nil), frame.Payload...)}, nil
+		return SessionResult{IPv4: frame.Payload[:len(frame.Payload):len(frame.Payload)]}, nil
 	default:
 		if s.Phase == PhaseClosed {
 			return SessionResult{}, fmt.Errorf("%w: %#x", ErrUnexpectedProtocol, frame.Protocol)
