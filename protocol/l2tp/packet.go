@@ -82,6 +82,15 @@ func (p Packet) MarshalBinary() ([]byte, error) {
 }
 
 func DecodePacket(b []byte) (Packet, error) {
+	p, err := DecodePacketView(b)
+	if err == nil {
+		p.Payload = append([]byte(nil), p.Payload...)
+	}
+	return p, err
+}
+
+// DecodePacketView borrows bounded payload slices for the lifetime of b.
+func DecodePacketView(b []byte) (Packet, error) {
 	if len(b) < 6 {
 		return Packet{}, ErrShortPacket
 	}
@@ -139,7 +148,7 @@ func DecodePacket(b []byte) (Packet, error) {
 			return Packet{}, err
 		}
 	} else {
-		p.Payload = append([]byte(nil), b[pos:end]...)
+		p.Payload = b[pos:end:end]
 	}
 	return p, nil
 }

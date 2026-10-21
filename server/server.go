@@ -134,11 +134,23 @@ type SessionPacketWriter func(peer net.Addr, tunnelID, sessionID uint16, payload
 // shared by raw L2TP and protected L2TP/IPsec transports so embedders observe a
 // single session and raw-IPv4 API independent of the outer transport.
 func (s *Server) Dispatch(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
+	return s.dispatch(ctx, result, protocol, write, false)
+}
+
+// DispatchIPv4 lets an embedder frame IPv4 directly into owned storage. The
+// writer receives caller-owned IPv4 and must copy it before retaining it.
+func (s *Server) DispatchIPv4(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
+	return s.dispatch(ctx, result, protocol, write, true)
+}
+func (s *Server) dispatch(ctx context.Context, result Result, protocol string, write SessionPacketWriter, ipv4 bool) error {
 	if s.Engine == nil || write == nil {
 		return errors.New("l2tp server: engine and packet writer are required")
 	}
 	newWriter := func(peer net.Addr, tunnelID, sessionID uint16) PacketWriter {
 		return func(payload []byte) error {
+			if ipv4 {
+				return write(peer, tunnelID, sessionID, payload)
+			}
 			packet, err := s.Engine.SendIPv4(tunnelID, sessionID, payload)
 			if err != nil {
 				return err
