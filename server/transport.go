@@ -47,6 +47,13 @@ type heapReceiveBuffer []byte
 func (b heapReceiveBuffer) Bytes() []byte { return b }
 func (b heapReceiveBuffer) Release()      { clear(b) }
 
+// SessionEligibility captures the current tunnel and PPP session identity.
+// The returned check rejects closed or replaced sessions even after numeric ID
+// reuse. It is safe to call from an asynchronous delivery consumer.
+func (e *Engine) SessionEligibility(tunnelID, sessionID uint16) func() bool {
+	return e.sendEligibility(tunnelID, sessionID)
+}
+
 // sendEligibility pins identity, not only numeric IDs, so an old writer cannot
 // send through a closed/replaced session even if its IDs have been reused.
 func (e *Engine) sendEligibility(tunnelID, sessionID uint16) func() bool {
