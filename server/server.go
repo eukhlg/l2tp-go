@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
@@ -22,6 +24,10 @@ type SessionOpenHandler func(context.Context, SessionInfo, PacketWriter) error
 type SessionCloseHandler func(context.Context, SessionInfo)
 
 type Server struct {
+	// BorrowedReceive opts callbacks into synchronous borrowed packet views.
+	// Copy payloads before retaining them beyond callback/dispatch return.
+	BorrowedReceive   bool
+	sendMu            sync.Mutex
 	Conn              net.PacketConn
 	Engine            *Engine
 	HandleData        DataHandler
@@ -62,67 +68,174 @@ func (s *Server) Serve(ctx context.Context) error {
 	if tick <= 0 {
 		tick = 500 * time.Millisecond
 	}
-	buffer := make([]byte, 65535)
+	size := 1
+	batch, batched := s.Conn.(BatchPacketConn)
+	if batched {
+		size = batch.BatchSize()
+		if size < 1 || size > 32 {
+			return errors.New("l2tp server: invalid socket batch size")
+		}
+	}
+	messages := make([]ReceivedDatagram, size)
+	buffers := make([]ReceiveBuffer, 0, size)
+	defer func() {
+		for _, buffer := range buffers {
+			buffer.Release()
+		}
+	}()
+	for i := range messages {
+		var buffer ReceiveBuffer
+		if allocator, ok := s.Conn.(ReceiveBufferAllocator); ok {
+			var err error
+			buffer, err = allocator.AcquireReceiveBuffer()
+			if err != nil {
+				return err
+			}
+		} else {
+			buffer = heapReceiveBuffer(make([]byte, 65535))
+		}
+		buffers = append(buffers, buffer)
+		messages[i].Payload = buffer.Bytes()
+	}
+	// Wake a read on cancellation and bound an in-flight/queued socket write.
+	// This watcher never closes the socket before best-effort StopCCN publication.
+	watcherDone, stopWatcher := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			_ = s.Conn.SetWriteDeadline(time.Now().Add(250 * time.Millisecond))
+			_ = s.Conn.SetReadDeadline(time.Now())
+		case <-stopWatcher:
+		}
+	}()
+	defer func() { close(stopWatcher); <-watcherDone }()
 	for {
 		if ctx.Err() != nil {
-			return s.gracefulShutdown(ctx)
+			return s.cancelShutdown(ctx)
 		}
 		if err := s.Conn.SetReadDeadline(time.Now().Add(tick)); err != nil {
 			return err
 		}
-		n, peer, err := s.Conn.ReadFrom(buffer)
+		count := 0
+		var err error
+		if batched {
+			count, err = batch.ReadBatch(messages)
+		} else {
+			m := &messages[0]
+			m.N, m.Peer, err = s.Conn.ReadFrom(m.Payload)
+			m.Truncated = m.N == len(m.Payload)
+			if err == nil {
+				count = 1
+			}
+		}
+		if count < 0 || count > len(messages) {
+			return io.ErrUnexpectedEOF
+		}
+		for i := 0; i < count; i++ {
+			if ctx.Err() != nil {
+				return s.cancelShutdown(ctx)
+			}
+			m := &messages[i]
+			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) && m.Peer != nil {
+				if handleErr := s.processDatagram(ctx, m.Peer, m.Payload[:m.N:m.N]); handleErr != nil {
+					if ctx.Err() != nil {
+						return s.cancelShutdown(ctx)
+					}
+					return handleErr
+				}
+			}
+			clear(m.Payload[:min(max(m.N, 0), len(m.Payload))])
+		}
 		if err != nil {
 			if ctx.Err() != nil {
-				return s.gracefulShutdown(ctx)
+				return s.cancelShutdown(ctx)
 			}
 			var netErr net.Error
 			if !errors.As(err, &netErr) || !netErr.Timeout() {
 				return err
 			}
-		} else {
-			result, handleErr := s.Engine.HandleDatagram(peer, buffer[:n], time.Now())
-			if handleErr != nil {
-				if errors.Is(handleErr, ErrNewTunnelRateLimited) {
-					s.Engine.tracef("datagram rate limited peer=%s", peer)
-					continue
-				}
-				if errors.Is(handleErr, ErrUnknownTunnel) && isTeardownControlDatagram(buffer[:n]) {
-					s.Engine.tracef("stale teardown ignored peer=%s bytes=%d", peer, n)
-					continue
-				}
-				s.Engine.debugf("datagram rejected peer=%s error=%v", peer, handleErr)
-				continue
-			} // A malformed peer must not stop the listener.
-			for _, reply := range result.Replies {
-				if _, err := s.Conn.WriteTo(reply, peer); err != nil {
-					return err
-				}
-				s.Engine.tracef("udp tx peer=%s bytes=%d", peer, len(reply))
-			}
-			writer := func(peer net.Addr, tunnelID, sessionID uint16, payload []byte) error {
-				_, err := s.Conn.WriteTo(payload, peer)
-				return err
-			}
-			if err := s.Dispatch(ctx, result, "l2tp", writer); err != nil {
-				return err
-			}
+		} else if count == 0 {
+			return io.ErrNoProgress
 		}
-		packets, closed, err := s.Engine.Retransmit(time.Now(), s.RetransmitTimeout, s.MaxRetries)
-		if err != nil {
+		if err := s.retransmit(ctx); err != nil {
+			if ctx.Err() != nil {
+				return s.cancelShutdown(ctx)
+			}
 			return err
 		}
-		if s.SessionClosed != nil {
-			for _, info := range closed {
-				info.Protocol = "l2tp"
-				s.SessionClosed(ctx, info)
+	}
+}
+
+func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte) error {
+	// Receiving data/ACKs must not wait behind outbound queue backpressure.
+	result, err := s.Engine.HandleDatagramBorrowed(peer, wire, time.Now())
+	if err == nil && len(result.Replies) > 0 {
+		s.sendMu.Lock()
+		for _, reply := range result.Replies {
+			if _, err = s.Conn.WriteTo(reply, peer); err != nil {
+				break
 			}
+			s.Engine.tracef("udp tx peer=%s bytes=%d", peer, len(reply))
 		}
+		s.sendMu.Unlock()
+	}
+	if err != nil {
+		// Protocol failures are peer-local; socket failures are terminal.
+		if len(result.Replies) > 0 {
+			return err
+		}
+		if errors.Is(err, ErrNewTunnelRateLimited) {
+			s.Engine.tracef("datagram rate limited peer=%s", peer)
+			return nil
+		}
+		if errors.Is(err, ErrUnknownTunnel) && isTeardownControlDatagram(wire) {
+			return nil
+		}
+		s.Engine.debugf("datagram rejected peer=%s error=%v", peer, err)
+		return nil
+	}
+	if !s.BorrowedReceive && result.Data != nil {
+		// Preserve legacy callbacks' independently owned result semantics.
+		result.Data.PPP.Payload = append([]byte(nil), result.Data.PPP.Payload...)
+		if result.Data.IPv4 != nil {
+			result.Data.IPv4 = append([]byte(nil), result.Data.IPv4...)
+		}
+	}
+	writer := func(peer net.Addr, tunnelID, sessionID uint16, payload []byte) error {
+		_, err := s.Conn.WriteTo(payload, peer)
+		return err
+	}
+	return s.Dispatch(ctx, result, "l2tp", writer)
+}
+func (s *Server) retransmit(ctx context.Context) error {
+	s.sendMu.Lock()
+	packets, closed, err := s.Engine.Retransmit(time.Now(), s.RetransmitTimeout, s.MaxRetries)
+	if err == nil {
 		for _, packet := range packets {
-			if _, err := s.Conn.WriteTo(packet.Payload, packet.Peer); err != nil {
-				return err
+			if _, err = s.Conn.WriteTo(packet.Payload, packet.Peer); err != nil {
+				break
 			}
 		}
 	}
+	s.sendMu.Unlock()
+	if s.SessionClosed != nil {
+		for _, info := range closed {
+			info.Protocol = "l2tp"
+			s.SessionClosed(ctx, info)
+		}
+	}
+	return err
+}
+func (s *Server) cancelShutdown(ctx context.Context) error {
+	err := s.gracefulShutdown(ctx)
+	if err != nil {
+		var ne net.Error
+		if !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) && !(errors.As(err, &ne) && ne.Timeout()) {
+			return err
+		}
+	}
+	return nil
 }
 
 // SessionPacketWriter is the transport-specific final step used by Dispatch.
@@ -147,13 +260,29 @@ func (s *Server) dispatch(ctx context.Context, result Result, protocol string, w
 		return errors.New("l2tp server: engine and packet writer are required")
 	}
 	newWriter := func(peer net.Addr, tunnelID, sessionID uint16) PacketWriter {
+		var eligible func() bool
+		if protocol == "l2tp" {
+			eligible = s.Engine.sendEligibility(tunnelID, sessionID)
+		}
 		return func(payload []byte) error {
+			if protocol == "l2tp" {
+				s.sendMu.Lock()
+				defer s.sendMu.Unlock()
+				if !eligible() {
+					return ErrSessionNotEstablished
+				}
+			}
 			if ipv4 {
 				return write(peer, tunnelID, sessionID, payload)
 			}
 			packet, err := s.Engine.SendIPv4(tunnelID, sessionID, payload)
 			if err != nil {
 				return err
+			}
+			if protocol == "l2tp" {
+				if sender, ok := s.Conn.(SessionDatagramWriter); ok {
+					return sender.WriteSessionPacket(packet.Payload, packet.Peer, eligible)
+				}
 			}
 			return write(peer, tunnelID, sessionID, packet.Payload)
 		}
@@ -191,23 +320,24 @@ func isTeardownControlDatagram(wire []byte) bool {
 }
 
 func (s *Server) gracefulShutdown(ctx context.Context) error {
+	s.sendMu.Lock()
 	packets, closed, err := s.Engine.Shutdown()
-	if err != nil {
-		return err
-	}
-	for _, packet := range packets {
-		if _, err := s.Conn.WriteTo(packet.Payload, packet.Peer); err != nil {
-			return err
+	if err == nil {
+		for _, packet := range packets {
+			if _, err = s.Conn.WriteTo(packet.Payload, packet.Peer); err != nil {
+				break
+			}
+			s.Engine.debugf("udp tx shutdown peer=%s bytes=%d", packet.Peer, len(packet.Payload))
 		}
-		s.Engine.debugf("udp tx shutdown peer=%s bytes=%d", packet.Peer, len(packet.Payload))
 	}
+	s.sendMu.Unlock()
 	if s.SessionClosed != nil {
 		for _, info := range closed {
 			info.Protocol = "l2tp"
 			s.SessionClosed(ctx, info)
 		}
 	}
-	return nil
+	return err
 }
 
 func (s *Server) Close() error {
