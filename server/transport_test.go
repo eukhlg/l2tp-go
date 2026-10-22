@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -271,5 +272,52 @@ func TestReceiveDataDoesNotWaitForOutboundSubmission(t *testing.T) {
 	case <-time.After(time.Second):
 		s.sendMu.Unlock()
 		t.Fatal("receive data blocked by outbound submission")
+	}
+}
+
+type sizedReceiveBatchConn struct {
+	receiveBatchConn
+	size int
+}
+
+func (c *sizedReceiveBatchConn) BatchSize() int { return c.size }
+
+func TestConfiguredReceiveBatchBoundsAndOwnership(t *testing.T) {
+	for _, size := range []int{1, 32, 128, 256} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			e, ch, peer, sid := dataSession(t)
+			c := &sizedReceiveBatchConn{size: size}
+			for i := 0; i < size; i++ {
+				c.packets = append(c.packets, ReceivedDatagram{Payload: dataWire(t, ch.PeerTunnelID, sid, byte(i)), Peer: peer})
+			}
+			s := &Server{Conn: c, Engine: e, BorrowedReceive: true}
+			handled := 0
+			s.HandleData = func(_ context.Context, f DataFrame) error {
+				if f.IPv4[20] != byte(handled) {
+					t.Fatal("configured batch reordered data")
+				}
+				handled++
+				return nil
+			}
+			if err := s.Serve(context.Background()); err != io.EOF {
+				t.Fatal(err)
+			}
+			if handled != size || len(c.owners) != size {
+				t.Fatalf("handled=%d owners=%d want=%d", handled, len(c.owners), size)
+			}
+			for _, b := range c.owners {
+				if b.released != 1 {
+					t.Fatal("configured batch leaked ownership")
+				}
+			}
+		})
+	}
+	for _, size := range []int{-1, 0, 257} {
+		e, _, _, _ := dataSession(t)
+		c := &sizedReceiveBatchConn{size: size}
+		s := &Server{Conn: c, Engine: e}
+		if err := s.Serve(context.Background()); err == nil || len(c.owners) != 0 {
+			t.Fatalf("invalid size %d: %v", size, err)
+		}
 	}
 }

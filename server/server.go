@@ -72,7 +72,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	batch, batched := s.Conn.(BatchPacketConn)
 	if batched {
 		size = batch.BatchSize()
-		if size < 1 || size > 32 {
+		if size < 1 || size > 256 {
 			return errors.New("l2tp server: invalid socket batch size")
 		}
 	}
