@@ -29,6 +29,11 @@ type SessionOpenHandler func(context.Context, SessionInfo, PacketWriter) error
 type SessionCloseHandler func(context.Context, SessionInfo)
 
 type Server struct {
+	// ReceivePipeline separates socket reads, ordered Engine processing, and
+	// route flush into three stages joined by bounded queues. Default off.
+	// NewRouteBatch must return independent state on every call when enabled.
+	ReceivePipeline bool
+
 	// BorrowedReceive opts callbacks into synchronous borrowed packet views.
 	// Copy payloads before retaining them beyond callback/dispatch return.
 	BorrowedReceive bool
@@ -42,7 +47,8 @@ type Server struct {
 	// buffers, for owned routers that prepend metadata in place (for example a
 	// TUN virtio header). Zero by default; at most 64.
 	ReceiveHeadroom int
-	// NewRouteBatch creates private state for this Serve reader. Flush must run
+	// NewRouteBatch creates private state for this driver (per read batch with
+	// ReceivePipeline). Flush must run
 	// before receive storage is cleared, reused or released, including on errors.
 	NewRouteBatch     func(context.Context) (context.Context, func() error)
 	SessionOpened     SessionOpenHandler
@@ -92,6 +98,9 @@ func (s *Server) Serve(ctx context.Context) error {
 	headroom := s.ReceiveHeadroom
 	if headroom < 0 || headroom > 64 {
 		return errors.New("l2tp server: receive headroom must be between 0 and 64")
+	}
+	if s.ReceivePipeline {
+		return s.servePipeline(ctx, size, headroom, tick, batch, batched)
 	}
 	flush := func() error { return nil }
 	if s.NewRouteBatch != nil {

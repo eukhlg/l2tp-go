@@ -100,3 +100,30 @@ func (s *Server) OwnedWriter(tunnelID, sessionID uint16) func(OwnedPacketBuffer)
 		return err
 	}
 }
+
+// SessionBindingGuard captures a session identity for delayed route publication.
+// The returned guard runs a short callback while excluding Engine teardown and
+// ID reuse. The callback must not call the Engine or perform device/socket I/O.
+func (e *Engine) SessionBindingGuard(tunnelID, sessionID uint16) func(func()) bool {
+	e.mu.Lock()
+	tunnel := e.tunnels[tunnelID]
+	var session *sessionRuntime
+	if tunnel != nil {
+		session = tunnel.sessions[sessionID]
+	}
+	e.mu.Unlock()
+	return func(f func()) bool {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		current := e.tunnels[tunnelID]
+		if tunnel == nil || session == nil || current != tunnel || current.sessions[sessionID] != session || session.ppp == nil || session.ppp.Phase != ppp.PhaseOpen {
+			return false
+		}
+		state, ok := current.state.Session(sessionID)
+		if !ok || state.State != l2tp.SessionEstablished {
+			return false
+		}
+		f()
+		return true
+	}
+}
