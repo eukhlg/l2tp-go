@@ -302,6 +302,7 @@ func TestConfiguredReceiveBatchBoundsAndOwnership(t *testing.T) {
 			if err := s.Serve(context.Background()); err != io.EOF {
 				t.Fatal(err)
 			}
+			// One envelope's buffers serve every read; none are acquired per read.
 			if handled != size || len(c.owners) != size {
 				t.Fatalf("handled=%d owners=%d want=%d", handled, len(c.owners), size)
 			}
@@ -409,5 +410,72 @@ func TestOwnedRouterFallbackKeepsLegacyCopies(t *testing.T) {
 	clear(wire)
 	if routed[20] != 1 || handled[len(handled)-1] != 1 {
 		t.Fatal("legacy callbacks received borrowed views")
+	}
+}
+
+type failingReceiveAllocator struct {
+	receiveBatchConn
+	failAt int
+	small  bool
+}
+
+func (c *failingReceiveAllocator) AcquireReceiveBuffer() (ReceiveBuffer, error) {
+	if len(c.owners) == c.failAt {
+		return nil, io.ErrShortBuffer
+	}
+	b, err := c.receiveBatchConn.AcquireReceiveBuffer()
+	if c.small {
+		c.owners[len(c.owners)-1].data = make([]byte, 8)
+	}
+	return b, err
+}
+func TestReceiveAllocationFailureReleasesPartialBatch(t *testing.T) {
+	for _, small := range []bool{false, true} {
+		c := &failingReceiveAllocator{failAt: 3, small: small}
+		s := &Server{Conn: c, Engine: NewEngine(Config{}), ReceiveHeadroom: 16}
+		if err := s.Serve(context.Background()); err == nil {
+			t.Fatal("expected allocation failure")
+		}
+		for _, b := range c.owners {
+			if b.released != 1 {
+				t.Fatal("partial batch leaked")
+			}
+		}
+	}
+}
+
+type reuseReceiveConn struct{ receiveBatchConn }
+
+// At the second read, the first read's buffers must already be flushed and
+// cleared, but still owned (reused, not released).
+func (c *reuseReceiveConn) ReadBatch(m []ReceivedDatagram) (int, error) {
+	if c.reads == 1 {
+		if len(c.owners) != c.BatchSize() {
+			return 0, errors.New("receive buffers acquired per read")
+		}
+		for _, b := range c.owners {
+			if b.released != 0 {
+				return 0, errors.New("receive storage released before Serve ends")
+			}
+			for _, v := range b.data {
+				if v != 0 {
+					return 0, errors.New("received bytes not cleared before reuse")
+				}
+			}
+		}
+	}
+	return c.receiveBatchConn.ReadBatch(m)
+}
+func TestSynchronousReceiveReusesClearedBuffersAfterFlush(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	c := &reuseReceiveConn{receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}}}}
+	s := &Server{Conn: c, Engine: e}
+	if err := s.Serve(context.Background()); err != io.EOF {
+		t.Fatal(err)
+	}
+	for _, b := range c.owners {
+		if b.released != 1 {
+			t.Fatal("receive storage not released exactly once at the end")
+		}
 	}
 }
