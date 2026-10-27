@@ -20,18 +20,31 @@ type PacketWriter func([]byte) error
 // IPv4Router accepts a packet from a client. The send callback may be used
 // synchronously to route zero or more return packets to that same PPP session.
 type IPv4Router func(context.Context, DataFrame, PacketWriter) error
+
+// OwnedIPv4Router borrows storage until the driver's batch flush returns.
+// frame.IPv4 starts at offset in storage; the driver retains ownership.
+type OwnedIPv4Router func(context.Context, DataFrame, []byte, int, PacketWriter) error
+
 type SessionOpenHandler func(context.Context, SessionInfo, PacketWriter) error
 type SessionCloseHandler func(context.Context, SessionInfo)
 
 type Server struct {
 	// BorrowedReceive opts callbacks into synchronous borrowed packet views.
 	// Copy payloads before retaining them beyond callback/dispatch return.
-	BorrowedReceive   bool
-	sendMu            sync.Mutex
-	Conn              net.PacketConn
-	Engine            *Engine
-	HandleData        DataHandler
-	RouteIPv4         IPv4Router
+	BorrowedReceive bool
+	sendMu          sync.Mutex
+	Conn            net.PacketConn
+	Engine          *Engine
+	HandleData      DataHandler
+	RouteIPv4       IPv4Router
+	RouteIPv4Owned  OwnedIPv4Router
+	// ReceiveHeadroom reserves bytes before each datagram in Serve's receive
+	// buffers, for owned routers that prepend metadata in place (for example a
+	// TUN virtio header). Zero by default; at most 64.
+	ReceiveHeadroom int
+	// NewRouteBatch creates private state for this Serve reader. Flush must run
+	// before receive storage is cleared, reused or released, including on errors.
+	NewRouteBatch     func(context.Context) (context.Context, func() error)
 	SessionOpened     SessionOpenHandler
 	SessionClosed     SessionCloseHandler
 	RetransmitTimeout time.Duration
@@ -76,9 +89,18 @@ func (s *Server) Serve(ctx context.Context) error {
 			return errors.New("l2tp server: invalid socket batch size")
 		}
 	}
+	headroom := s.ReceiveHeadroom
+	if headroom < 0 || headroom > 64 {
+		return errors.New("l2tp server: receive headroom must be between 0 and 64")
+	}
+	flush := func() error { return nil }
+	if s.NewRouteBatch != nil {
+		ctx, flush = s.NewRouteBatch(ctx)
+	}
 	messages := make([]ReceivedDatagram, size)
 	buffers := make([]ReceiveBuffer, 0, size)
 	defer func() {
+		_ = flush()
 		for _, buffer := range buffers {
 			buffer.Release()
 		}
@@ -92,10 +114,14 @@ func (s *Server) Serve(ctx context.Context) error {
 				return err
 			}
 		} else {
-			buffer = heapReceiveBuffer(make([]byte, 65535))
+			buffer = heapReceiveBuffer(make([]byte, 65535+headroom))
 		}
 		buffers = append(buffers, buffer)
-		messages[i].Payload = buffer.Bytes()
+		storage := buffer.Bytes()
+		if len(storage) <= headroom {
+			return errors.New("l2tp server: receive buffer smaller than headroom")
+		}
+		messages[i].Payload = storage[headroom:]
 	}
 	// Wake a read on cancellation and bound an in-flight/queued socket write.
 	// This watcher never closes the socket before best-effort StopCCN publication.
@@ -138,13 +164,19 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			m := &messages[i]
 			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) && m.Peer != nil {
-				if handleErr := s.processDatagram(ctx, m.Peer, m.Payload[:m.N:m.N]); handleErr != nil {
+				if handleErr := s.processDatagram(WithPacketStorage(ctx, buffers[i].Bytes()), m.Peer, m.Payload[:m.N:m.N]); handleErr != nil {
 					if ctx.Err() != nil {
 						return s.cancelShutdown(ctx)
 					}
 					return handleErr
 				}
 			}
+		}
+		if flushErr := flush(); flushErr != nil {
+			return flushErr
+		}
+		for i := 0; i < count; i++ {
+			m := &messages[i]
 			clear(m.Payload[:min(max(m.N, 0), len(m.Payload))])
 		}
 		if err != nil {
@@ -195,7 +227,12 @@ func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte
 		s.Engine.debugf("datagram rejected peer=%s error=%v", peer, err)
 		return nil
 	}
-	if !s.BorrowedReceive && result.Data != nil {
+	copyBorrowed := false
+	if !s.BorrowedReceive && result.Data != nil && s.RouteIPv4Owned != nil {
+		// The owned router keeps the borrowed frame; legacy consumers still get
+		// independent copies, made only where they are used.
+		copyBorrowed = true
+	} else if !s.BorrowedReceive && result.Data != nil {
 		// Preserve legacy callbacks' independently owned result semantics.
 		result.Data.PPP.Payload = append([]byte(nil), result.Data.PPP.Payload...)
 		if result.Data.IPv4 != nil {
@@ -206,7 +243,7 @@ func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte
 		_, err := s.Conn.WriteTo(payload, peer)
 		return err
 	}
-	return s.Dispatch(ctx, result, "l2tp", writer)
+	return s.dispatch(ctx, result, "l2tp", writer, false, copyBorrowed)
 }
 func (s *Server) retransmit(ctx context.Context) error {
 	s.sendMu.Lock()
@@ -247,15 +284,18 @@ type SessionPacketWriter func(peer net.Addr, tunnelID, sessionID uint16, payload
 // shared by raw L2TP and protected L2TP/IPsec transports so embedders observe a
 // single session and raw-IPv4 API independent of the outer transport.
 func (s *Server) Dispatch(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
-	return s.dispatch(ctx, result, protocol, write, false)
+	return s.dispatch(ctx, result, protocol, write, false, false)
 }
 
 // DispatchIPv4 lets an embedder frame IPv4 directly into owned storage. The
 // writer receives caller-owned IPv4 and must copy it before retaining it.
 func (s *Server) DispatchIPv4(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
-	return s.dispatch(ctx, result, protocol, write, true)
+	return s.dispatch(ctx, result, protocol, write, true, false)
 }
-func (s *Server) dispatch(ctx context.Context, result Result, protocol string, write SessionPacketWriter, ipv4 bool) error {
+
+// copyBorrowed gives HandleData and the RouteIPv4 fallback independent copies
+// of a borrowed frame while the owned router keeps the original.
+func (s *Server) dispatch(ctx context.Context, result Result, protocol string, write SessionPacketWriter, ipv4, copyBorrowed bool) error {
 	if s.Engine == nil || write == nil {
 		return errors.New("l2tp server: engine and packet writer are required")
 	}
@@ -300,13 +340,39 @@ func (s *Server) dispatch(ctx context.Context, result Result, protocol string, w
 			s.SessionClosed(ctx, info)
 		}
 	}
+	var owned *DataFrame
+	independent := func() DataFrame {
+		if owned == nil {
+			frame := *result.Data
+			frame.PPP.Payload = append([]byte(nil), frame.PPP.Payload...)
+			if frame.IPv4 != nil {
+				frame.IPv4 = append([]byte(nil), frame.IPv4...)
+			}
+			owned = &frame
+		}
+		return *owned
+	}
 	if result.Data != nil && s.HandleData != nil {
-		if err := s.HandleData(ctx, *result.Data); err != nil {
+		data := *result.Data
+		if copyBorrowed {
+			data = independent()
+		}
+		if err := s.HandleData(ctx, data); err != nil {
 			return err
+		}
+	}
+	if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4Owned != nil {
+		frame := *result.Data
+		storage, offset, ok := packetStorage(ctx, frame.IPv4)
+		if ok {
+			return s.RouteIPv4Owned(ctx, frame, storage, offset, newWriter(frame.Peer, frame.TunnelID, frame.Session.LocalID))
 		}
 	}
 	if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4 != nil {
 		frame := *result.Data
+		if copyBorrowed {
+			frame = independent()
+		}
 		if err := s.RouteIPv4(ctx, frame, newWriter(frame.Peer, frame.TunnelID, frame.Session.LocalID)); err != nil {
 			return err
 		}
