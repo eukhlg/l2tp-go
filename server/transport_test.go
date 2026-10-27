@@ -325,7 +325,7 @@ func TestConfiguredReceiveBatchBoundsAndOwnership(t *testing.T) {
 func TestOwnedRouteFlushBeforeReadReuse(t *testing.T) {
 	e, ch, peer, sid := dataSession(t)
 	c := &receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}, {Payload: dataWire(t, ch.PeerTunnelID, sid, 2), Peer: peer}}}
-	s := &Server{Conn: c, Engine: e, BorrowedReceive: true}
+	s := &Server{Conn: c, Engine: e, BorrowedReceive: true, ReceiveHeadroom: 16}
 	var pending [][]byte
 	flushed := 0
 	s.NewRouteBatch = func(ctx context.Context) (context.Context, func() error) {
@@ -358,5 +358,56 @@ func TestOwnedRouteFlushBeforeReadReuse(t *testing.T) {
 	}
 	if flushed != 1 {
 		t.Fatalf("flushes=%d", flushed)
+	}
+}
+
+func TestReceiveHeadroomDefaultsToZeroAndIsBounded(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	c := &receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}}}
+	s := &Server{Conn: c, Engine: e, BorrowedReceive: true, NewRouteBatch: func(ctx context.Context) (context.Context, func() error) {
+		return ctx, func() error { return nil }
+	}}
+	var offset int
+	s.RouteIPv4Owned = func(_ context.Context, f DataFrame, storage []byte, o int, _ PacketWriter) error {
+		offset = o
+		return nil
+	}
+	if err := s.Serve(context.Background()); err != io.EOF {
+		t.Fatal(err)
+	}
+	// With no headroom, the frame starts right after the L2TP and PPP headers.
+	if offset <= 0 || offset >= 16 {
+		t.Fatalf("offset=%d with default headroom", offset)
+	}
+	for _, bad := range []int{-1, 65} {
+		s := &Server{Conn: &receiveBatchConn{}, Engine: e, ReceiveHeadroom: bad}
+		if err := s.Serve(context.Background()); err == nil || err == io.EOF {
+			t.Fatalf("headroom %d accepted", bad)
+		}
+	}
+}
+
+// Legacy consumers keep independent copies when an owned router is set but
+// the owned path cannot be used for a frame.
+func TestOwnedRouterFallbackKeepsLegacyCopies(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	wire := dataWire(t, ch.PeerTunnelID, sid, 1)
+	s := &Server{Conn: &receiveBatchConn{}, Engine: e}
+	s.RouteIPv4Owned = func(context.Context, DataFrame, []byte, int, PacketWriter) error {
+		t.Fatal("owned path used without packet storage")
+		return nil
+	}
+	var routed, handled []byte
+	s.RouteIPv4 = func(_ context.Context, f DataFrame, _ PacketWriter) error { routed = f.IPv4; return nil }
+	s.HandleData = func(_ context.Context, f DataFrame) error { handled = f.PPP.Payload; return nil }
+	if err := s.processDatagram(context.Background(), peer, wire); err != nil {
+		t.Fatal(err)
+	}
+	if routed == nil || handled == nil {
+		t.Fatal("legacy callbacks not called")
+	}
+	clear(wire)
+	if routed[20] != 1 || handled[len(handled)-1] != 1 {
+		t.Fatal("legacy callbacks received borrowed views")
 	}
 }
