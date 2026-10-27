@@ -97,32 +97,6 @@ func (s *Server) Serve(ctx context.Context) error {
 	if s.NewRouteBatch != nil {
 		ctx, flush = s.NewRouteBatch(ctx)
 	}
-	messages := make([]ReceivedDatagram, size)
-	buffers := make([]ReceiveBuffer, 0, size)
-	defer func() {
-		_ = flush()
-		for _, buffer := range buffers {
-			buffer.Release()
-		}
-	}()
-	for i := range messages {
-		var buffer ReceiveBuffer
-		if allocator, ok := s.Conn.(ReceiveBufferAllocator); ok {
-			var err error
-			buffer, err = allocator.AcquireReceiveBuffer()
-			if err != nil {
-				return err
-			}
-		} else {
-			buffer = heapReceiveBuffer(make([]byte, 65535+headroom))
-		}
-		buffers = append(buffers, buffer)
-		storage := buffer.Bytes()
-		if len(storage) <= headroom {
-			return errors.New("l2tp server: receive buffer smaller than headroom")
-		}
-		messages[i].Payload = storage[headroom:]
-	}
 	// Wake a read on cancellation and bound an in-flight/queued socket write.
 	// This watcher never closes the socket before best-effort StopCCN publication.
 	watcherDone, stopWatcher := make(chan struct{}), make(chan struct{})
@@ -143,41 +117,28 @@ func (s *Server) Serve(ctx context.Context) error {
 		if err := s.Conn.SetReadDeadline(time.Now().Add(tick)); err != nil {
 			return err
 		}
-		count := 0
-		var err error
-		if batched {
-			count, err = batch.ReadBatch(messages)
-		} else {
-			m := &messages[0]
-			m.N, m.Peer, err = s.Conn.ReadFrom(m.Payload)
-			m.Truncated = m.N == len(m.Payload)
-			if err == nil {
-				count = 1
-			}
+		received, err := s.acquireReadBatch(size, headroom)
+		if err != nil {
+			return err
 		}
-		if count < 0 || count > len(messages) {
-			return io.ErrUnexpectedEOF
-		}
-		for i := 0; i < count; i++ {
-			if ctx.Err() != nil {
-				return s.cancelShutdown(ctx)
-			}
-			m := &messages[i]
-			if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) && m.Peer != nil {
-				if handleErr := s.processDatagram(WithPacketStorage(ctx, buffers[i].Bytes()), m.Peer, m.Payload[:m.N:m.N]); handleErr != nil {
-					if ctx.Err() != nil {
-						return s.cancelShutdown(ctx)
-					}
-					return handleErr
+		count, err := received.read(s.Conn, batch, batched)
+		handleErr := func() (handleErr error) {
+			defer received.release()
+			defer func() {
+				if flushErr := flush(); handleErr == nil {
+					handleErr = flushErr
 				}
+			}()
+			if count < 0 || count > len(received.messages) {
+				return io.ErrUnexpectedEOF
 			}
+			return s.processReadBatch(ctx, received, count)
+		}()
+		if ctx.Err() != nil {
+			return s.cancelShutdown(ctx)
 		}
-		if flushErr := flush(); flushErr != nil {
-			return flushErr
-		}
-		for i := 0; i < count; i++ {
-			m := &messages[i]
-			clear(m.Payload[:min(max(m.N, 0), len(m.Payload))])
+		if handleErr != nil {
+			return handleErr
 		}
 		if err != nil {
 			if ctx.Err() != nil {

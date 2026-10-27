@@ -302,7 +302,7 @@ func TestConfiguredReceiveBatchBoundsAndOwnership(t *testing.T) {
 			if err := s.Serve(context.Background()); err != io.EOF {
 				t.Fatal(err)
 			}
-			if handled != size || len(c.owners) != size {
+			if handled != size || len(c.owners) != 2*size {
 				t.Fatalf("handled=%d owners=%d want=%d", handled, len(c.owners), size)
 			}
 			for _, b := range c.owners {
@@ -409,5 +409,64 @@ func TestOwnedRouterFallbackKeepsLegacyCopies(t *testing.T) {
 	clear(wire)
 	if routed[20] != 1 || handled[len(handled)-1] != 1 {
 		t.Fatal("legacy callbacks received borrowed views")
+	}
+}
+
+type failingReceiveAllocator struct {
+	receiveBatchConn
+	failAt int
+	small  bool
+}
+
+func (c *failingReceiveAllocator) AcquireReceiveBuffer() (ReceiveBuffer, error) {
+	if len(c.owners) == c.failAt {
+		return nil, io.ErrShortBuffer
+	}
+	b, err := c.receiveBatchConn.AcquireReceiveBuffer()
+	if c.small {
+		c.owners[len(c.owners)-1].data = make([]byte, 8)
+	}
+	return b, err
+}
+func TestReceiveAllocationFailureReleasesPartialBatch(t *testing.T) {
+	for _, small := range []bool{false, true} {
+		c := &failingReceiveAllocator{failAt: 3, small: small}
+		s := &Server{Conn: c, Engine: NewEngine(Config{}), ReceiveHeadroom: 16}
+		if err := s.Serve(context.Background()); err == nil {
+			t.Fatal("expected allocation failure")
+		}
+		for _, b := range c.owners {
+			if b.released != 1 {
+				t.Fatal("partial batch leaked")
+			}
+		}
+	}
+}
+
+type freshReceiveConn struct{ receiveBatchConn }
+
+func (c *freshReceiveConn) ReadBatch(m []ReceivedDatagram) (int, error) {
+	if c.reads == 1 {
+		for i, b := range c.owners {
+			want := 0
+			if i < c.BatchSize() {
+				want = 1
+			}
+			if b.released != want {
+				return 0, errors.New("receive storage reused or released early")
+			}
+		}
+	}
+	return c.receiveBatchConn.ReadBatch(m)
+}
+func TestSynchronousReceiveUsesFreshBuffersAfterFlush(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	c := &freshReceiveConn{receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}}}}
+	s := &Server{Conn: c, Engine: e}
+	if err := s.Serve(context.Background()); err != io.EOF {
+		t.Fatal(err)
+	}
+	if len(c.owners) != 2*c.BatchSize() {
+		t.Fatal("read slots were reused")
 	}
 }
