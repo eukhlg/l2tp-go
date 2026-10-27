@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net"
 	"testing"
 )
@@ -30,5 +31,54 @@ func BenchmarkSamePeerUDP(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		peerComparison = samePeer(a, c)
+	}
+}
+
+func TestPlainWriterCachedPerSessionAndForgotten(t *testing.T) {
+	e, _, _, sid := dataSession(t)
+	s := &Server{Conn: &receiveBatchConn{}, Engine: e}
+	var tid uint16
+	for id := range e.tunnels {
+		tid = id
+	}
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1701}
+	_ = s.plainWriter(peer, tid, sid)
+	// A rebuilt writer allocates; a cached lookup must not.
+	if allocs := testing.AllocsPerRun(100, func() { _ = s.plainWriter(peer, tid, sid) }); allocs != 0 {
+		t.Fatalf("cached writer lookup allocates %v", allocs)
+	}
+	if len(s.writers) != 1 {
+		t.Fatalf("writers=%d", len(s.writers))
+	}
+	s.forgetWriter(tid, sid)
+	if len(s.writers) != 0 {
+		t.Fatal("writer not forgotten")
+	}
+	other := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 2), Port: 1701}
+	alternate := func() { _ = s.plainWriter(other, tid, sid); _ = s.plainWriter(peer, tid, sid) }
+	if allocs := testing.AllocsPerRun(10, alternate); allocs == 0 {
+		t.Fatal("writer reused for a different peer")
+	}
+}
+
+func TestPacketStorageSlot(t *testing.T) {
+	ctx := WithPacketStorageSlot(context.Background())
+	storage := make([]byte, 64)
+	frame := storage[16:40]
+	if _, _, ok := packetStorage(ctx, frame); ok {
+		t.Fatal("empty slot resolved storage")
+	}
+	if !SetPacketStorage(ctx, storage) {
+		t.Fatal("slot missing")
+	}
+	got, offset, ok := packetStorage(ctx, frame)
+	if !ok || offset != 16 || &got[0] != &storage[0] {
+		t.Fatal("slot storage not resolved")
+	}
+	if allocs := testing.AllocsPerRun(100, func() { SetPacketStorage(ctx, storage) }); allocs != 0 {
+		t.Fatalf("SetPacketStorage allocates %v", allocs)
+	}
+	if SetPacketStorage(context.Background(), storage) {
+		t.Fatal("set without slot reported success")
 	}
 }

@@ -21,8 +21,10 @@ type receivedBatch struct {
 }
 type processedBatch struct {
 	batch *readBatch
-	flush func() error
 }
+
+// Envelopes in flight: two queued at each boundary plus one in each stage.
+const receivePipelineBatches = 2*receivePipelineQueueSize + 3
 
 func (s *Server) servePipeline(parent context.Context, size, headroom int, tick time.Duration, conn BatchPacketConn, batched bool) error {
 	ctx, cancel := context.WithCancel(parent)
@@ -49,6 +51,8 @@ func (s *Server) servePipeline(parent context.Context, size, headroom int, tick 
 		_ = s.Conn.SetReadDeadline(time.Now())
 	}()
 	defer func() { cancel(); <-watcherDone }()
+	pool := s.newReadBatchPool(ctx, size, headroom, receivePipelineBatches)
+	defer pool.close()
 	received := make(chan receivedBatch, receivePipelineQueueSize)
 	processed := make(chan processedBatch, receivePipelineQueueSize)
 	receiveDone, flushDone := make(chan struct{}), make(chan struct{})
@@ -65,14 +69,16 @@ func (s *Server) servePipeline(parent context.Context, size, headroom int, tick 
 			if ctx.Err() != nil {
 				return
 			}
-			b, err := s.acquireReadBatch(size, headroom)
+			b, err := pool.acquire()
 			if err != nil {
-				fail(err)
+				if ctx.Err() == nil {
+					fail(err)
+				}
 				return
 			}
 			n, readErr := b.read(s.Conn, conn, batched)
 			if n < 0 || n > len(b.messages) {
-				b.release()
+				pool.recycle(b)
 				fail(io.ErrUnexpectedEOF)
 				return
 			}
@@ -87,7 +93,7 @@ func (s *Server) servePipeline(parent context.Context, size, headroom int, tick 
 			select {
 			case received <- receivedBatch{b, n, readErr}:
 			case <-ctx.Done():
-				b.release()
+				pool.recycle(b)
 				return
 			}
 			if terminal {
@@ -99,8 +105,8 @@ func (s *Server) servePipeline(parent context.Context, size, headroom int, tick 
 		defer close(flushDone)
 		for b := range processed {
 			// Even partial/error batches must flush their retained views before release.
-			err := b.flush()
-			b.batch.release()
+			err := b.batch.flush()
+			pool.recycle(b.batch)
 			if err != nil {
 				fail(err)
 			}
@@ -109,18 +115,13 @@ func (s *Server) servePipeline(parent context.Context, size, headroom int, tick 
 	var readFailure error
 	for b := range received {
 		if ctx.Err() != nil {
-			b.batch.release()
+			pool.recycle(b.batch)
 			continue
 		}
-		batchCtx := ctx
-		flush := func() error { return nil }
-		if s.NewRouteBatch != nil {
-			batchCtx, flush = s.NewRouteBatch(ctx)
-		}
-		err := s.processReadBatch(batchCtx, b.batch, b.count)
+		err := s.processReadBatch(b.batch, b.count)
 		// Ownership is transferred even on partial dispatch failure. Flush is the
-		// only consumer that releases processed buffers; processing never reuses them.
-		processed <- processedBatch{b.batch, flush}
+		// only consumer that recycles processed buffers; processing never reuses them.
+		processed <- processedBatch{b.batch}
 		if err != nil {
 			fail(err)
 			continue

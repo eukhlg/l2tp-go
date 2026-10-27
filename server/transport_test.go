@@ -302,7 +302,8 @@ func TestConfiguredReceiveBatchBoundsAndOwnership(t *testing.T) {
 			if err := s.Serve(context.Background()); err != io.EOF {
 				t.Fatal(err)
 			}
-			if handled != size || len(c.owners) != 2*size {
+			// One envelope's buffers serve every read; none are acquired per read.
+			if handled != size || len(c.owners) != size {
 				t.Fatalf("handled=%d owners=%d want=%d", handled, len(c.owners), size)
 			}
 			for _, b := range c.owners {
@@ -443,30 +444,38 @@ func TestReceiveAllocationFailureReleasesPartialBatch(t *testing.T) {
 	}
 }
 
-type freshReceiveConn struct{ receiveBatchConn }
+type reuseReceiveConn struct{ receiveBatchConn }
 
-func (c *freshReceiveConn) ReadBatch(m []ReceivedDatagram) (int, error) {
+// At the second read, the first read's buffers must already be flushed and
+// cleared, but still owned (reused, not released).
+func (c *reuseReceiveConn) ReadBatch(m []ReceivedDatagram) (int, error) {
 	if c.reads == 1 {
-		for i, b := range c.owners {
-			want := 0
-			if i < c.BatchSize() {
-				want = 1
+		if len(c.owners) != c.BatchSize() {
+			return 0, errors.New("receive buffers acquired per read")
+		}
+		for _, b := range c.owners {
+			if b.released != 0 {
+				return 0, errors.New("receive storage released before Serve ends")
 			}
-			if b.released != want {
-				return 0, errors.New("receive storage reused or released early")
+			for _, v := range b.data {
+				if v != 0 {
+					return 0, errors.New("received bytes not cleared before reuse")
+				}
 			}
 		}
 	}
 	return c.receiveBatchConn.ReadBatch(m)
 }
-func TestSynchronousReceiveUsesFreshBuffersAfterFlush(t *testing.T) {
+func TestSynchronousReceiveReusesClearedBuffersAfterFlush(t *testing.T) {
 	e, ch, peer, sid := dataSession(t)
-	c := &freshReceiveConn{receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}}}}
+	c := &reuseReceiveConn{receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}}}}
 	s := &Server{Conn: c, Engine: e}
 	if err := s.Serve(context.Background()); err != io.EOF {
 		t.Fatal(err)
 	}
-	if len(c.owners) != 2*c.BatchSize() {
-		t.Fatal("read slots were reused")
+	for _, b := range c.owners {
+		if b.released != 1 {
+			t.Fatal("receive storage not released exactly once at the end")
+		}
 	}
 }

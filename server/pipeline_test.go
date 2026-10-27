@@ -154,6 +154,7 @@ func TestPipelineOrderedDataControlMultipleTunnels(t *testing.T) {
 			for _, v := range views {
 				flushed = append(flushed, v[20])
 			}
+			views = views[:0] // route batches are reused per envelope
 			return nil
 		}
 	}
