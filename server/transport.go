@@ -42,6 +42,12 @@ type SessionDatagramWriter interface {
 	WriteSessionPacket([]byte, net.Addr, func() bool) error
 }
 
+// FlowPacketWriter is OwnedPacketWriter with a flow key, for transports that
+// spread sends over shards. Datagrams with equal flow keys keep their order.
+type FlowPacketWriter interface {
+	WriteFlowPacket(OwnedPacketBuffer, net.Addr, func() bool, uint32) error
+}
+
 type heapReceiveBuffer []byte
 
 func (b heapReceiveBuffer) Bytes() []byte { return b }
@@ -55,25 +61,63 @@ func (e *Engine) SessionEligibility(tunnelID, sessionID uint16) func() bool {
 }
 
 // sendEligibility pins identity, not only numeric IDs, so an old writer cannot
-// send through a closed/replaced session even if its IDs have been reused.
+// send through a closed/replaced session even if its IDs have been reused. It
+// reads the session's sendable flag without locking: the flag is cleared under
+// Engine.mu before a session is released, and numeric IDs are reused only after
+// that release, so the captured runtime answers for exactly one session.
 func (e *Engine) sendEligibility(tunnelID, sessionID uint16) func() bool {
 	e.mu.Lock()
-	tunnel := e.tunnels[tunnelID]
 	var session *sessionRuntime
-	if tunnel != nil {
+	if tunnel := e.tunnels[tunnelID]; tunnel != nil {
 		session = tunnel.sessions[sessionID]
 	}
 	e.mu.Unlock()
-	return func() bool {
-		e.mu.Lock()
-		defer e.mu.Unlock()
-		current := e.tunnels[tunnelID]
-		if tunnel == nil || session == nil || current != tunnel || current.sessions[sessionID] != session || session.ppp == nil || session.ppp.Phase != ppp.PhaseOpen {
-			return false
-		}
-		state, ok := current.state.Session(sessionID)
-		return ok && state.State == l2tp.SessionEstablished
+	if session == nil {
+		return func() bool { return false }
 	}
+	return session.sendable.Load
+}
+
+// SessionFramer frames IPv4 for one established session without taking the
+// Engine lock per packet. The peer IDs and outer address are fixed for the
+// session's life; Sendable turns false for good once the session closes.
+type SessionFramer struct {
+	session                 *sessionRuntime
+	peer                    net.Addr
+	peerTunnel, peerSession uint16
+}
+
+// SessionFramer captures the framing context of an established session.
+func (e *Engine) SessionFramer(tunnelID, sessionID uint16) (*SessionFramer, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	runtime, ok := e.tunnels[tunnelID]
+	if !ok {
+		return nil, ErrUnknownTunnel
+	}
+	state, ok := runtime.state.Session(sessionID)
+	session := runtime.sessions[sessionID]
+	if !ok || state.State != l2tp.SessionEstablished || session == nil || !session.sendable.Load() {
+		return nil, ErrSessionNotEstablished
+	}
+	return &SessionFramer{session: session, peer: runtime.peer, peerTunnel: runtime.state.PeerTunnelID, peerSession: state.PeerID}, nil
+}
+
+// Sendable reports whether the session is still established and PPP open.
+func (f *SessionFramer) Sendable() bool { return f.session.sendable.Load() }
+
+// Peer returns the session's outer UDP address. Callers must not modify it.
+func (f *SessionFramer) Peer() net.Addr { return f.peer }
+
+// PrependIPv4 adds the PPP and L2TP data headers in front of buffer's IPv4.
+func (f *SessionFramer) PrependIPv4(buffer HeaderBuffer) error {
+	if !f.session.sendable.Load() {
+		return ErrSessionNotEstablished
+	}
+	if err := ppp.PrependFrame(buffer, ppp.ProtocolIPv4); err != nil {
+		return err
+	}
+	return l2tp.PrependData(buffer, f.peerTunnel, f.peerSession)
 }
 
 // OwnedWriter returns a per-session plaintext writer consuming each buffer.
@@ -97,6 +141,41 @@ func (s *Server) OwnedWriter(tunnelID, sessionID uint16) func(OwnedPacketBuffer)
 		}
 		defer buffer.Release()
 		_, err = s.Conn.WriteTo(buffer.Bytes(), peer)
+		return err
+	}
+}
+
+// OwnedFlowWriter is OwnedWriter for sharded transports: it frames with a
+// SessionFramer, without the Engine or send locks per packet, and passes flow
+// (an inner flow hash) on, so one flow keeps its order on a sharded sender.
+// Ownership: every buffer is consumed on every outcome; once a transport
+// accepts it, that transport releases it exactly once after the write.
+// Data and control messages use independent L2TP channels, so data needs no
+// ordering against control sends; a closed session stops data via Sendable.
+func (s *Server) OwnedFlowWriter(tunnelID, sessionID uint16) func(OwnedPacketBuffer, uint32) error {
+	framer, framerErr := s.Engine.SessionFramer(tunnelID, sessionID)
+	if framerErr != nil {
+		return func(buffer OwnedPacketBuffer, _ uint32) error {
+			buffer.Release()
+			return framerErr
+		}
+	}
+	eligible := framer.Sendable
+	flowWriter, _ := s.Conn.(FlowPacketWriter)
+	ownedWriter, _ := s.Conn.(OwnedPacketWriter)
+	return func(buffer OwnedPacketBuffer, flow uint32) error {
+		if err := framer.PrependIPv4(buffer); err != nil {
+			buffer.Release()
+			return err
+		}
+		switch {
+		case flowWriter != nil:
+			return flowWriter.WriteFlowPacket(buffer, framer.peer, eligible, flow)
+		case ownedWriter != nil:
+			return ownedWriter.WritePacket(buffer, framer.peer, eligible)
+		}
+		defer buffer.Release()
+		_, err := s.Conn.WriteTo(buffer.Bytes(), framer.peer)
 		return err
 	}
 }

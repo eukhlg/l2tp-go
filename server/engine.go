@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
@@ -76,6 +77,11 @@ type sessionRuntime struct {
 	username string
 	admitted bool
 	opened   bool
+	// sendable mirrors "L2TP session established and PPP open" for lock-free
+	// readers. It is written only under Engine.mu, right after each change of
+	// either state, and cleared before the session is released, so a reader
+	// holding this runtime never sees a closed or replaced session as open.
+	sendable atomic.Bool
 }
 
 type tunnelRuntime struct {
@@ -384,6 +390,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	e.tracef("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
 	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
 	pppResult, err := pppSession.HandleBorrowed(frame)
+	sessionRuntime.sendable.Store(pppSession.Phase == ppp.PhaseOpen) // also after a rejected frame
 	if err != nil {
 		e.debugf("ppp reject peer=%s tunnel=%d session=%d protocol=%#04x phase=%s error=%v", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, err)
 		return Result{}, err
@@ -585,6 +592,7 @@ func (e *Engine) releaseSession(runtime *tunnelRuntime, sessionID uint16) *Sessi
 	if session == nil {
 		return nil
 	}
+	session.sendable.Store(false)
 	if e.config.AddressPool != nil {
 		e.config.AddressPool.Release(session.address)
 	}

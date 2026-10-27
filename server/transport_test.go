@@ -98,7 +98,9 @@ func dataSession(t *testing.T) (*Engine, *l2tp.ControlChannel, testPeer, uint16)
 		t.Fatal(err)
 	}
 	p.Phase = ppp.PhaseOpen
-	e.tunnels[ch.PeerTunnelID].sessions[sid] = &sessionRuntime{ppp: p, opened: true, address: netip.MustParseAddr("10.0.0.2")}
+	session := &sessionRuntime{ppp: p, opened: true, address: netip.MustParseAddr("10.0.0.2")}
+	session.sendable.Store(true) // as the Engine does when PPP reaches Open
+	e.tunnels[ch.PeerTunnelID].sessions[sid] = session
 	return e, ch, peer, sid
 }
 func dataWire(t *testing.T, tid, sid uint16, value byte) []byte {
@@ -478,4 +480,125 @@ func TestSynchronousReceiveReusesClearedBuffersAfterFlush(t *testing.T) {
 			t.Fatal("receive storage not released exactly once at the end")
 		}
 	}
+}
+
+type flowOwnedConn struct {
+	receiveBatchConn
+	flows    []uint32
+	payloads [][]byte
+	eligible []func() bool
+}
+
+func (c *flowOwnedConn) WriteFlowPacket(b OwnedPacketBuffer, _ net.Addr, eligible func() bool, flow uint32) error {
+	c.flows = append(c.flows, flow)
+	c.payloads = append(c.payloads, append([]byte(nil), b.Bytes()...))
+	c.eligible = append(c.eligible, eligible)
+	b.Release()
+	return nil
+}
+
+func TestOwnedFlowWriterMatchesOwnedWriterFraming(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	flowConn := &flowOwnedConn{}
+	write := (&Server{Conn: flowConn, Engine: e}).OwnedFlowWriter(ch.PeerTunnelID, sid)
+	queued := &queuedOwnedConn{}
+	legacy := (&Server{Conn: queued, Engine: e}).OwnedWriter(ch.PeerTunnelID, sid)
+	ip := []byte{0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2}
+	b := &ownedTestBuffer{storage: make([]byte, 64+20), start: 64}
+	copy(b.storage[64:], ip)
+	if err := write(b, 0xabcd); err != nil {
+		t.Fatal(err)
+	}
+	b = &ownedTestBuffer{storage: make([]byte, 64+20), start: 64}
+	copy(b.storage[64:], ip)
+	if err := legacy(b); err != nil {
+		t.Fatal(err)
+	}
+	if len(flowConn.flows) != 1 || flowConn.flows[0] != 0xabcd {
+		t.Fatalf("flow key not passed: %v", flowConn.flows)
+	}
+	if string(flowConn.payloads[0]) != string(queued.pending[0].buffer.Bytes()) {
+		t.Fatal("flow writer framing differs from OwnedWriter")
+	}
+	queued.pending[0].buffer.Release()
+	if !flowConn.eligible[0]() {
+		t.Fatal("open session ineligible")
+	}
+	e.ClosePeer(peer)
+	if flowConn.eligible[0]() {
+		t.Fatal("closed session still eligible")
+	}
+	b = &ownedTestBuffer{storage: make([]byte, 84), start: 64}
+	if err := write(b, 1); !errors.Is(err, ErrSessionNotEstablished) || b.released != 1 {
+		t.Fatalf("closed session err=%v releases=%d", err, b.released)
+	}
+	// A writer for a session that is already gone rejects and consumes.
+	b = &ownedTestBuffer{storage: make([]byte, 84), start: 64}
+	if err := (&Server{Conn: flowConn, Engine: e}).OwnedFlowWriter(ch.PeerTunnelID, sid)(b, 1); err == nil || b.released != 1 {
+		t.Fatalf("stale writer err=%v releases=%d", err, b.released)
+	}
+}
+
+func TestOwnedFlowWriterConcurrentClosure(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	c := &queuedOwnedConn{}
+	write := (&Server{Conn: c, Engine: e}).OwnedFlowWriter(ch.PeerTunnelID, sid)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			b := &ownedTestBuffer{storage: make([]byte, 64+20), start: 64}
+			if err := write(b, uint32(i)); err != nil && !errors.Is(err, ErrSessionNotEstablished) {
+				t.Error(err)
+			}
+		}
+	}()
+	go func() { defer wg.Done(); e.ClosePeer(peer) }()
+	wg.Wait()
+	for _, q := range c.pending {
+		if q.eligible() {
+			t.Fatal("queued packet eligible after closure")
+		}
+		q.buffer.Release()
+	}
+}
+
+type releasingFlowConn struct{ receiveBatchConn }
+
+func (releasingFlowConn) WriteFlowPacket(b OwnedPacketBuffer, _ net.Addr, _ func() bool, _ uint32) error {
+	b.Release()
+	return nil
+}
+
+func TestOwnedFlowWriterDoesNotAllocate(t *testing.T) {
+	e, ch, _, sid := dataSession(t)
+	write := (&Server{Conn: &releasingFlowConn{}, Engine: e}).OwnedFlowWriter(ch.PeerTunnelID, sid)
+	b := &reusableBuffer{storage: make([]byte, 84)}
+	allocs := testing.AllocsPerRun(1000, func() {
+		b.start = 64
+		if err := write(b, 7); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("OwnedFlowWriter allocated %.1f times per packet", allocs)
+	}
+}
+
+// reusableBuffer is an OwnedPacketBuffer whose Release keeps the storage.
+type reusableBuffer struct {
+	storage []byte
+	start   int
+}
+
+func (b *reusableBuffer) Bytes() []byte { return b.storage[b.start:] }
+func (b *reusableBuffer) Len() int      { return len(b.storage) - b.start }
+func (b *reusableBuffer) Release()      {}
+func (b *reusableBuffer) Prepend(n int) ([]byte, error) {
+	if n > b.start {
+		return nil, errors.New("no headroom")
+	}
+	b.start -= n
+	return b.storage[b.start : b.start+n], nil
 }
