@@ -321,3 +321,42 @@ func TestConfiguredReceiveBatchBoundsAndOwnership(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnedRouteFlushBeforeReadReuse(t *testing.T) {
+	e, ch, peer, sid := dataSession(t)
+	c := &receiveBatchConn{packets: []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}, {Payload: dataWire(t, ch.PeerTunnelID, sid, 2), Peer: peer}}}
+	s := &Server{Conn: c, Engine: e, BorrowedReceive: true}
+	var pending [][]byte
+	flushed := 0
+	s.NewRouteBatch = func(ctx context.Context) (context.Context, func() error) {
+		return ctx, func() error {
+			if len(pending) == 0 {
+				return nil
+			}
+			if c.reads != 1 {
+				t.Fatal("flush waited for next read")
+			}
+			for i, p := range pending {
+				if p[20] != byte(i+1) {
+					t.Fatal("packet cleared before flush")
+				}
+			}
+			flushed++
+			pending = nil
+			return nil
+		}
+	}
+	s.RouteIPv4Owned = func(_ context.Context, f DataFrame, storage []byte, offset int, _ PacketWriter) error {
+		if offset < 16 || &storage[offset] != &f.IPv4[0] {
+			t.Fatal("missing headroom or copied packet")
+		}
+		pending = append(pending, f.IPv4)
+		return nil
+	}
+	if err := s.Serve(context.Background()); err != io.EOF {
+		t.Fatal(err)
+	}
+	if flushed != 1 {
+		t.Fatalf("flushes=%d", flushed)
+	}
+}
