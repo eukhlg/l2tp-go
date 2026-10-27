@@ -362,7 +362,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	if !ok {
 		return Result{}, ErrUnknownTunnel
 	}
-	if peerKey(runtime.peer) != peerKey(peer) {
+	if !samePeer(runtime.peer, peer) {
 		return Result{}, ErrPeerAddress
 	}
 	session, ok := runtime.state.Session(packet.SessionID)
@@ -598,6 +598,20 @@ func (e *Engine) releaseSession(runtime *tunnelRuntime, sessionID uint16) *Sessi
 	runtime.state.RemoveSession(sessionID)
 	e.debugf("ppp released tunnel=%d session=%d address=%s user=%s", runtime.state.LocalTunnelID, sessionID, session.address, session.username)
 	return &SessionInfo{TunnelID: runtime.state.LocalTunnelID, SessionID: sessionID, Address: session.address, Peer: runtime.peer, Username: session.username, Connected: session.opened}
+}
+
+// samePeer preserves peerKey equality without formatting UDP addresses.
+func samePeer(a, b net.Addr) bool {
+	left, lok := a.(*net.UDPAddr)
+	right, rok := b.(*net.UDPAddr)
+	if lok && rok {
+		if left == nil || right == nil {
+			return left == right
+		}
+		return left.Port == right.Port && left.Zone == right.Zone &&
+			(left.IP.Equal(right.IP) || string(left.IP) == string(right.IP))
+	}
+	return peerKey(a) == peerKey(b)
 }
 
 func peerKey(addr net.Addr) string {
