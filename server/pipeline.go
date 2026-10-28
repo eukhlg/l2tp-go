@@ -26,7 +26,7 @@ type processedBatch struct {
 // Envelopes in flight: two queued at each boundary plus one in each stage.
 const receivePipelineBatches = 2*receivePipelineQueueSize + 3
 
-func (s *Server) servePipeline(parent context.Context, size, headroom int, tick time.Duration, conn BatchPacketConn, batched bool) error {
+func (s *Server) servePipeline(parent context.Context, size int, tick time.Duration, conn BatchPacketConn, batched bool) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var mu sync.Mutex
@@ -51,7 +51,7 @@ func (s *Server) servePipeline(parent context.Context, size, headroom int, tick 
 		_ = s.Conn.SetReadDeadline(time.Now())
 	}()
 	defer func() { cancel(); <-watcherDone }()
-	pool := s.newReadBatchPool(ctx, size, headroom, receivePipelineBatches)
+	pool := s.newReadBatchPool(ctx, size, receivePipelineBatches)
 	defer pool.close()
 	received := make(chan receivedBatch, receivePipelineQueueSize)
 	processed := make(chan processedBatch, receivePipelineQueueSize)

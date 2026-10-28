@@ -9,10 +9,12 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
 	"github.com/eukhlg/l2tp-go/protocol/ppp"
+	"github.com/eukhlg/netio/packetbuf"
 )
 
 var (
@@ -47,6 +49,10 @@ type DataFrame struct {
 	PPP      ppp.Frame
 	IPv4     []byte
 	Peer     net.Addr
+	// Buffer, when set, is the driver-owned storage holding IPv4, borrowed
+	// until the driver's batch flush returns. It enables RouteIPv4Owned and is
+	// never released by callbacks. Independent copies carry none.
+	Buffer *packetbuf.Buffer
 }
 
 type Result struct {
@@ -76,6 +82,11 @@ type sessionRuntime struct {
 	username string
 	admitted bool
 	opened   bool
+	// sendable mirrors "L2TP session established and PPP open" for lock-free
+	// readers. It is written only under Engine.mu, right after each change of
+	// either state, and cleared before the session is released, so a reader
+	// holding this runtime never sees a closed or replaced session as open.
+	sendable atomic.Bool
 }
 
 type tunnelRuntime struct {
@@ -384,6 +395,7 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 	e.tracef("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
 	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
 	pppResult, err := pppSession.HandleBorrowed(frame)
+	sessionRuntime.sendable.Store(pppSession.Phase == ppp.PhaseOpen) // also after a rejected frame
 	if err != nil {
 		e.debugf("ppp reject peer=%s tunnel=%d session=%d protocol=%#04x phase=%s error=%v", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, err)
 		return Result{}, err
@@ -444,14 +456,9 @@ func (e *Engine) SendIPv4(tunnelID, sessionID uint16, payload []byte) (Datagram,
 	return Datagram{Payload: wire, Peer: runtime.peer}, nil
 }
 
-// HeaderBuffer allows independent embedders to provide owned packet storage.
-type HeaderBuffer interface {
-	Prepend(int) ([]byte, error)
-	Len() int
-}
-
-// PrependIPv4 adds the uncompressed PPP and L2TP data headers in reserved space.
-func (e *Engine) PrependIPv4(tunnelID, sessionID uint16, buffer HeaderBuffer) (net.Addr, error) {
+// PrependIPv4 adds the uncompressed PPP and L2TP data headers in the buffer's
+// headroom.
+func (e *Engine) PrependIPv4(tunnelID, sessionID uint16, buffer *packetbuf.Buffer) (net.Addr, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	runtime, ok := e.tunnels[tunnelID]
@@ -585,6 +592,7 @@ func (e *Engine) releaseSession(runtime *tunnelRuntime, sessionID uint16) *Sessi
 	if session == nil {
 		return nil
 	}
+	session.sendable.Store(false)
 	if e.config.AddressPool != nil {
 		e.config.AddressPool.Release(session.address)
 	}

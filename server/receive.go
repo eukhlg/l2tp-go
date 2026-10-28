@@ -4,39 +4,43 @@ import (
 	"context"
 	"errors"
 	"net"
+
+	"github.com/eukhlg/netio/packetbuf"
+	"github.com/eukhlg/netio/udptransport"
 )
 
 // readBatch is an exclusive ownership envelope. It may be transferred only as
 // a whole, and recycled only after all consumers (including route flush)
-// finish. Envelopes and their buffers are reused for the life of Serve, so a
-// read costs no allocation and recycling clears only the bytes received.
+// finish. Envelopes and their netio buffers are reused for the life of Serve,
+// so a read costs no allocation and recycling clears only the bytes received
+// and each buffer's headroom.
 type readBatch struct {
-	messages []ReceivedDatagram
-	buffers  []ReceiveBuffer
-	headroom int
-	count    int
-	// ctx carries this envelope's route batch and packet-storage slot; flush
-	// writes the route batch. Both are created once per envelope.
-	ctx     context.Context
-	flush   func() error
-	storage *packetStorageSlot
+	messages []udptransport.Message
+	buffers  []*packetbuf.Buffer
+	// heads are the buffers' headrooms, where an owned router may write a
+	// header (for example a TUN virtio header) in front of a packet.
+	heads [][]byte
+	count int
+	// ctx carries this envelope's route batch; flush writes it. Both are
+	// created once per envelope.
+	ctx   context.Context
+	flush func() error
 }
 
 // readBatchPool bounds receive storage: at most max envelopes exist, and
 // acquire blocks until one is recycled.
 type readBatchPool struct {
-	s        *Server
-	ctx      context.Context
-	size     int
-	headroom int
-	max      int
-	created  int
-	all      []*readBatch
-	free     chan *readBatch
+	s       *Server
+	ctx     context.Context
+	size    int
+	max     int
+	created int
+	all     []*readBatch
+	free    chan *readBatch
 }
 
-func (s *Server) newReadBatchPool(ctx context.Context, size, headroom, max int) *readBatchPool {
-	return &readBatchPool{s: s, ctx: ctx, size: size, headroom: headroom, max: max, free: make(chan *readBatch, max)}
+func (s *Server) newReadBatchPool(ctx context.Context, size, max int) *readBatchPool {
+	return &readBatchPool{s: s, ctx: ctx, size: size, max: max, free: make(chan *readBatch, max)}
 }
 
 // acquire must be called from one goroutine at a time (the receive stage).
@@ -64,67 +68,75 @@ func (p *readBatchPool) acquire() (*readBatch, error) {
 }
 
 func (p *readBatchPool) newBatch() (*readBatch, error) {
-	b := &readBatch{messages: make([]ReceivedDatagram, p.size), buffers: make([]ReceiveBuffer, 0, p.size), headroom: p.headroom}
+	b := &readBatch{messages: make([]udptransport.Message, p.size), buffers: make([]*packetbuf.Buffer, 0, p.size), heads: make([][]byte, 0, p.size)}
 	for i := range b.messages {
-		var buffer ReceiveBuffer
-		if allocator, ok := p.s.Conn.(ReceiveBufferAllocator); ok {
-			var err error
-			buffer, err = allocator.AcquireReceiveBuffer()
-			if err != nil {
-				b.release()
-				return nil, err
-			}
-		} else {
-			buffer = heapReceiveBuffer(make([]byte, 65535+p.headroom))
+		buffer, err := p.s.acquireBuffer(packetbuf.MaxPacket)
+		if err != nil {
+			b.release(p.s.releaseBuffer)
+			return nil, err
 		}
 		b.buffers = append(b.buffers, buffer)
-		storage := buffer.Bytes()
-		if len(storage) <= p.headroom {
-			b.release()
-			return nil, errors.New("l2tp server: receive buffer smaller than headroom")
+		head, err := buffer.Prepend(buffer.Headroom())
+		if err == nil {
+			err = buffer.TrimFront(len(head))
 		}
-		b.messages[i].Payload = storage[p.headroom:]
+		if err != nil || len(head) == 0 {
+			b.release(p.s.releaseBuffer)
+			return nil, errors.New("l2tp server: receive buffer without headroom")
+		}
+		b.heads = append(b.heads, head)
+		b.messages[i].Payload = buffer.Bytes()
 	}
-	b.storage = &packetStorageSlot{}
 	b.ctx, b.flush = p.ctx, func() error { return nil }
 	if p.s.NewRouteBatch != nil {
 		b.ctx, b.flush = p.s.NewRouteBatch(p.ctx)
 	}
-	b.ctx = context.WithValue(b.ctx, packetStorageSlotKey{}, b.storage)
 	return b, nil
 }
 
 // recycle clears the received bytes and the headroom (a TUN virtio header may
-// have been written there; GRO growth is scrubbed by the router) and makes the
-// envelope available again. Called once per acquire, after flush.
+// have been written there; GRO growth is scrubbed by the router), restores
+// each buffer's view after an owned router moved it, and makes the envelope
+// available again. Called once per acquire, after flush.
 func (p *readBatchPool) recycle(b *readBatch) {
 	for i := 0; i < b.count && i < len(b.messages); i++ {
 		m := &b.messages[i]
-		storage := b.buffers[i].Bytes()
-		clear(storage[:b.headroom])
+		clear(b.heads[i])
 		clear(m.Payload[:min(max(m.N, 0), len(m.Payload))])
 		m.N, m.Peer, m.Truncated = 0, nil, false
+		restoreView(b.buffers[i], len(b.heads[i]), len(m.Payload))
 	}
 	b.count = 0
-	b.storage.storage = nil
 	p.free <- b
+}
+
+// restoreView sets buffer's view back to its receive payload: head bytes of
+// headroom, then size bytes.
+func restoreView(buffer *packetbuf.Buffer, head, size int) {
+	_, _ = buffer.Prepend(buffer.Headroom())
+	_ = buffer.TrimFront(head)
+	if n := size - buffer.Len(); n > 0 {
+		_, _ = buffer.Append(n)
+	}
 }
 
 // close releases every envelope's buffers. All envelopes must have been
 // recycled or abandoned by their stages.
 func (p *readBatchPool) close() {
 	for _, b := range p.all {
-		b.release()
+		b.release(p.s.releaseBuffer)
 	}
 	p.all = nil
 }
 
-func (b *readBatch) release() {
+func (b *readBatch) release(release func(*packetbuf.Buffer)) {
 	for _, buffer := range b.buffers {
-		buffer.Release()
+		release(buffer)
 	}
 	clear(b.buffers)
 	b.buffers = nil
+	clear(b.heads)
+	b.heads = nil
 	clear(b.messages)
 }
 
@@ -154,13 +166,10 @@ func (s *Server) processReadBatch(b *readBatch, count int) error {
 		}
 		m := &b.messages[i]
 		if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) && m.Peer != nil {
-			b.storage.storage = b.buffers[i].Bytes()
-			if err := s.processDatagram(b.ctx, m.Peer, m.Payload[:m.N:m.N]); err != nil {
-				b.storage.storage = nil
+			if err := s.processDatagram(b.ctx, m.Peer, m.Payload[:m.N:m.N], b.buffers[i]); err != nil {
 				return err
 			}
 		}
 	}
-	b.storage.storage = nil
 	return nil
 }

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"context"
 	"net"
 	"testing"
 )
@@ -58,27 +57,5 @@ func TestPlainWriterCachedPerSessionAndForgotten(t *testing.T) {
 	alternate := func() { _ = s.plainWriter(other, tid, sid); _ = s.plainWriter(peer, tid, sid) }
 	if allocs := testing.AllocsPerRun(10, alternate); allocs == 0 {
 		t.Fatal("writer reused for a different peer")
-	}
-}
-
-func TestPacketStorageSlot(t *testing.T) {
-	ctx := WithPacketStorageSlot(context.Background())
-	storage := make([]byte, 64)
-	frame := storage[16:40]
-	if _, _, ok := packetStorage(ctx, frame); ok {
-		t.Fatal("empty slot resolved storage")
-	}
-	if !SetPacketStorage(ctx, storage) {
-		t.Fatal("slot missing")
-	}
-	got, offset, ok := packetStorage(ctx, frame)
-	if !ok || offset != 16 || &got[0] != &storage[0] {
-		t.Fatal("slot storage not resolved")
-	}
-	if allocs := testing.AllocsPerRun(100, func() { SetPacketStorage(ctx, storage) }); allocs != 0 {
-		t.Fatalf("SetPacketStorage allocates %v", allocs)
-	}
-	if SetPacketStorage(context.Background(), storage) {
-		t.Fatal("set without slot reported success")
 	}
 }
