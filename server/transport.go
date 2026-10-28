@@ -5,38 +5,25 @@ import (
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
 	"github.com/eukhlg/l2tp-go/protocol/ppp"
+	"github.com/eukhlg/netio/packetbuf"
+	"github.com/eukhlg/netio/udptransport"
 )
 
-// ReceivedDatagram is one socket message. Only entries in the returned prefix
-// are valid. Truncated messages must never be passed to the protocol engine.
-type ReceivedDatagram struct {
-	Payload   []byte
-	N         int
-	Peer      net.Addr
-	Truncated bool
-}
-
-// BatchPacketConn is an optional outer-UDP capability, not a delivery interface.
-// Implementations preserve boundaries and retain the PacketConn deadline/close contract.
+// BatchPacketConn is an optional outer-UDP capability, not a delivery interface:
+// batched reads into netio messages. Only entries in the returned prefix are
+// valid; truncated messages are never passed to the protocol engine.
+// Implementations preserve boundaries and the PacketConn deadline/close
+// contract, and must not replace a message's Payload. UDPTransport implements it.
 type BatchPacketConn interface {
 	net.PacketConn
 	BatchSize() int
-	ReadBatch([]ReceivedDatagram) (int, error)
-}
-type ReceiveBuffer interface {
-	Bytes() []byte
-	Release()
-}
-type ReceiveBufferAllocator interface{ AcquireReceiveBuffer() (ReceiveBuffer, error) }
-type OwnedPacketBuffer interface {
-	HeaderBuffer
-	ReceiveBuffer
+	ReadBatch([]udptransport.Message) (int, error)
 }
 
 // OwnedPacketWriter consumes buffer on every outcome. Accepted buffers stay
 // alive through final send/rejection; eligible must be rechecked before sending.
 type OwnedPacketWriter interface {
-	WritePacket(OwnedPacketBuffer, net.Addr, func() bool) error
+	WritePacket(*packetbuf.Buffer, net.Addr, func() bool) error
 }
 type SessionDatagramWriter interface {
 	WriteSessionPacket([]byte, net.Addr, func() bool) error
@@ -45,13 +32,8 @@ type SessionDatagramWriter interface {
 // FlowPacketWriter is OwnedPacketWriter with a flow key, for transports that
 // spread sends over shards. Datagrams with equal flow keys keep their order.
 type FlowPacketWriter interface {
-	WriteFlowPacket(OwnedPacketBuffer, net.Addr, func() bool, uint32) error
+	WriteFlowPacket(*packetbuf.Buffer, net.Addr, func() bool, uint32) error
 }
-
-type heapReceiveBuffer []byte
-
-func (b heapReceiveBuffer) Bytes() []byte { return b }
-func (b heapReceiveBuffer) Release()      { clear(b) }
 
 // SessionEligibility captures the current tunnel and PPP session identity.
 // The returned check rejects closed or replaced sessions even after numeric ID
@@ -110,7 +92,7 @@ func (f *SessionFramer) Sendable() bool { return f.session.sendable.Load() }
 func (f *SessionFramer) Peer() net.Addr { return f.peer }
 
 // PrependIPv4 adds the PPP and L2TP data headers in front of buffer's IPv4.
-func (f *SessionFramer) PrependIPv4(buffer HeaderBuffer) error {
+func (f *SessionFramer) PrependIPv4(buffer *packetbuf.Buffer) error {
 	if !f.session.sendable.Load() {
 		return ErrSessionNotEstablished
 	}
@@ -122,9 +104,9 @@ func (f *SessionFramer) PrependIPv4(buffer HeaderBuffer) error {
 
 // OwnedWriter returns a per-session plaintext writer consuming each buffer.
 // It preserves individual framing and UDP datagrams; delivery to TUN is unrelated.
-func (s *Server) OwnedWriter(tunnelID, sessionID uint16) func(OwnedPacketBuffer) error {
+func (s *Server) OwnedWriter(tunnelID, sessionID uint16) func(*packetbuf.Buffer) error {
 	eligible := s.Engine.sendEligibility(tunnelID, sessionID)
-	return func(buffer OwnedPacketBuffer) error {
+	return func(buffer *packetbuf.Buffer) error {
 		s.sendMu.Lock()
 		defer s.sendMu.Unlock()
 		if !eligible() {
@@ -152,10 +134,10 @@ func (s *Server) OwnedWriter(tunnelID, sessionID uint16) func(OwnedPacketBuffer)
 // accepts it, that transport releases it exactly once after the write.
 // Data and control messages use independent L2TP channels, so data needs no
 // ordering against control sends; a closed session stops data via Sendable.
-func (s *Server) OwnedFlowWriter(tunnelID, sessionID uint16) func(OwnedPacketBuffer, uint32) error {
+func (s *Server) OwnedFlowWriter(tunnelID, sessionID uint16) func(*packetbuf.Buffer, uint32) error {
 	framer, framerErr := s.Engine.SessionFramer(tunnelID, sessionID)
 	if framerErr != nil {
-		return func(buffer OwnedPacketBuffer, _ uint32) error {
+		return func(buffer *packetbuf.Buffer, _ uint32) error {
 			buffer.Release()
 			return framerErr
 		}
@@ -163,7 +145,7 @@ func (s *Server) OwnedFlowWriter(tunnelID, sessionID uint16) func(OwnedPacketBuf
 	eligible := framer.Sendable
 	flowWriter, _ := s.Conn.(FlowPacketWriter)
 	ownedWriter, _ := s.Conn.(OwnedPacketWriter)
-	return func(buffer OwnedPacketBuffer, flow uint32) error {
+	return func(buffer *packetbuf.Buffer, flow uint32) error {
 		if err := framer.PrependIPv4(buffer); err != nil {
 			buffer.Release()
 			return err

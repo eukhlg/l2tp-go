@@ -14,6 +14,7 @@ import (
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
 	"github.com/eukhlg/l2tp-go/protocol/ppp"
+	"github.com/eukhlg/netio/packetbuf"
 )
 
 var (
@@ -48,6 +49,10 @@ type DataFrame struct {
 	PPP      ppp.Frame
 	IPv4     []byte
 	Peer     net.Addr
+	// Buffer, when set, is the driver-owned storage holding IPv4, borrowed
+	// until the driver's batch flush returns. It enables RouteIPv4Owned and is
+	// never released by callbacks. Independent copies carry none.
+	Buffer *packetbuf.Buffer
 }
 
 type Result struct {
@@ -451,14 +456,9 @@ func (e *Engine) SendIPv4(tunnelID, sessionID uint16, payload []byte) (Datagram,
 	return Datagram{Payload: wire, Peer: runtime.peer}, nil
 }
 
-// HeaderBuffer allows independent embedders to provide owned packet storage.
-type HeaderBuffer interface {
-	Prepend(int) ([]byte, error)
-	Len() int
-}
-
-// PrependIPv4 adds the uncompressed PPP and L2TP data headers in reserved space.
-func (e *Engine) PrependIPv4(tunnelID, sessionID uint16, buffer HeaderBuffer) (net.Addr, error) {
+// PrependIPv4 adds the uncompressed PPP and L2TP data headers in the buffer's
+// headroom.
+func (e *Engine) PrependIPv4(tunnelID, sessionID uint16, buffer *packetbuf.Buffer) (net.Addr, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	runtime, ok := e.tunnels[tunnelID]

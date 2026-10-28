@@ -8,33 +8,19 @@ import (
 	"net"
 	"reflect"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
+	"github.com/eukhlg/netio/udptransport"
 )
-
-type pipelineOwner struct {
-	data     []byte
-	releases atomic.Int32
-}
-
-func (b *pipelineOwner) Bytes() []byte { return b.data }
-func (b *pipelineOwner) Release() {
-	if b.releases.Add(1) != 1 {
-		panic("double release")
-	}
-	clear(b.data)
-}
 
 type pipelineConn struct {
 	mu           sync.Mutex
-	batches      [][]ReceivedDatagram
-	owners       []*pipelineOwner
+	batches      [][]udptransport.Message
+	buffers      *testBuffers
 	reads        int
 	size         int
-	failAt       int
 	readErr      error
 	invalidCount bool
 	waitAtEnd    bool
@@ -43,21 +29,11 @@ type pipelineConn struct {
 	control      func([]byte)
 }
 
-func newPipelineConn(packets ...[]ReceivedDatagram) *pipelineConn {
-	return &pipelineConn{batches: packets, size: 1, failAt: -1, wake: make(chan struct{}), readErr: io.EOF}
+func newPipelineConn(packets ...[]udptransport.Message) *pipelineConn {
+	return &pipelineConn{batches: packets, size: 1, buffers: newTestBuffers(), wake: make(chan struct{}), readErr: io.EOF}
 }
 func (c *pipelineConn) BatchSize() int { return c.size }
-func (c *pipelineConn) AcquireReceiveBuffer() (ReceiveBuffer, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.failAt >= 0 && len(c.owners) == c.failAt {
-		return nil, io.ErrShortBuffer
-	}
-	b := &pipelineOwner{data: make([]byte, 2048)}
-	c.owners = append(c.owners, b)
-	return b, nil
-}
-func (c *pipelineConn) ReadBatch(messages []ReceivedDatagram) (int, error) {
+func (c *pipelineConn) ReadBatch(messages []udptransport.Message) (int, error) {
 	c.mu.Lock()
 	i := c.reads
 	c.reads++
@@ -99,11 +75,7 @@ func (c *pipelineConn) SetDeadline(t time.Time) error    { return c.SetReadDeadl
 func (c *pipelineConn) readCount() int                   { c.mu.Lock(); defer c.mu.Unlock(); return c.reads }
 func (c *pipelineConn) checkReleased(t *testing.T) {
 	t.Helper()
-	for _, b := range c.owners {
-		if b.releases.Load() != 1 {
-			t.Fatalf("buffer released %d times", b.releases.Load())
-		}
-	}
+	c.buffers.check(t)
 }
 func awaitPipeline(t *testing.T, done <-chan error) error {
 	t.Helper()
@@ -129,11 +101,11 @@ func TestPipelineOrderedDataControlMultipleTunnels(t *testing.T) {
 	hello, _ := ch.Queue(l2tp.ControlMessage{Type: l2tp.Hello}, time.Now())
 	ohello, _ := och.Queue(l2tp.ControlMessage{Type: l2tp.Hello}, time.Now())
 	c := newPipelineConn(
-		[]ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}},
-		[]ReceivedDatagram{{Payload: hello, Peer: peer}},
-		[]ReceivedDatagram{{Payload: dataWire(t, tid, osid, 2), Peer: runtime.peer}},
-		[]ReceivedDatagram{{Payload: ohello, Peer: runtime.peer}},
-		[]ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 3), Peer: peer}},
+		[]udptransport.Message{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}},
+		[]udptransport.Message{{Payload: hello, Peer: peer}},
+		[]udptransport.Message{{Payload: dataWire(t, tid, osid, 2), Peer: runtime.peer}},
+		[]udptransport.Message{{Payload: ohello, Peer: runtime.peer}},
+		[]udptransport.Message{{Payload: dataWire(t, ch.PeerTunnelID, sid, 3), Peer: peer}},
 	)
 	var process []string
 	c.control = func(p []byte) {
@@ -145,7 +117,7 @@ func TestPipelineOrderedDataControlMultipleTunnels(t *testing.T) {
 			process = append(process, "control")
 		}
 	}
-	s := &Server{Conn: c, Engine: e, BorrowedReceive: true, ReceivePipeline: true}
+	s := c.buffers.install(&Server{Conn: c, Engine: e, BorrowedReceive: true, ReceivePipeline: true})
 	var flushed []byte
 	type batchKey struct{}
 	s.NewRouteBatch = func(ctx context.Context) (context.Context, func() error) {
@@ -158,8 +130,8 @@ func TestPipelineOrderedDataControlMultipleTunnels(t *testing.T) {
 			return nil
 		}
 	}
-	s.RouteIPv4Owned = func(ctx context.Context, f DataFrame, storage []byte, offset int, _ PacketWriter) error {
-		if &storage[offset] != &f.IPv4[0] {
+	s.RouteIPv4Owned = func(ctx context.Context, f DataFrame, _ PacketWriter) error {
+		if &f.Buffer.Bytes()[0] != &f.IPv4[0] {
 			t.Error("packet copied")
 		}
 		process = append(process, fmt.Sprint(f.IPv4[20]))
@@ -185,9 +157,9 @@ func TestPipelineBackpressureAndDisabledSynchronousPath(t *testing.T) {
 			e, ch, peer, sid := dataSession(t)
 			c := newPipelineConn()
 			for i := 0; i < 80; i++ {
-				c.batches = append(c.batches, []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, byte(i)), Peer: peer}})
+				c.batches = append(c.batches, []udptransport.Message{{Payload: dataWire(t, ch.PeerTunnelID, sid, byte(i)), Peer: peer}})
 			}
-			s := &Server{Conn: c, Engine: e, BorrowedReceive: true, ReceivePipeline: enabled}
+			s := c.buffers.install(&Server{Conn: c, Engine: e, BorrowedReceive: true, ReceivePipeline: enabled})
 			entered, release := make(chan struct{}), make(chan struct{})
 			var once sync.Once
 			type batchKey struct{}
@@ -206,7 +178,7 @@ func TestPipelineBackpressureAndDisabledSynchronousPath(t *testing.T) {
 					return nil
 				}
 			}
-			s.RouteIPv4Owned = func(ctx context.Context, f DataFrame, _ []byte, _ int, _ PacketWriter) error {
+			s.RouteIPv4Owned = func(ctx context.Context, f DataFrame, _ PacketWriter) error {
 				p := ctx.Value(batchKey{}).(*[][]byte)
 				*p = append(*p, f.IPv4)
 				return nil
@@ -256,15 +228,15 @@ func TestPipelineErrorsAndCancellationReleaseEveryBuffer(t *testing.T) {
 			e, ch, peer, sid := dataSession(t)
 			c := newPipelineConn()
 			for i := 0; i < 20; i++ {
-				c.batches = append(c.batches, []ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, byte(i)), Peer: peer}})
+				c.batches = append(c.batches, []udptransport.Message{{Payload: dataWire(t, ch.PeerTunnelID, sid, byte(i)), Peer: peer}})
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			s := &Server{Conn: c, Engine: e, ReceivePipeline: true, BorrowedReceive: true}
+			s := c.buffers.install(&Server{Conn: c, Engine: e, ReceivePipeline: true, BorrowedReceive: true})
 			sentinel := errors.New("injected failure")
 			c.readErr = sentinel
 			if failure == "allocate" {
-				c.failAt = 3
+				c.buffers.failAt = 3
 			}
 			if failure == "invalid-count" {
 				c.invalidCount = true
@@ -317,11 +289,11 @@ func TestPipelineErrorsAndCancellationReleaseEveryBuffer(t *testing.T) {
 
 func TestPipelineFlushesWithoutWaitingForMoreTraffic(t *testing.T) {
 	e, ch, peer, sid := dataSession(t)
-	c := newPipelineConn([]ReceivedDatagram{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}})
+	c := newPipelineConn([]udptransport.Message{{Payload: dataWire(t, ch.PeerTunnelID, sid, 1), Peer: peer}})
 	c.waitAtEnd = true
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s := &Server{Conn: c, Engine: e, ReceivePipeline: true}
+	s := c.buffers.install(&Server{Conn: c, Engine: e, ReceivePipeline: true})
 	flushed := make(chan struct{}, 1)
 	s.NewRouteBatch = func(ctx context.Context) (context.Context, func() error) {
 		return ctx, func() error { flushed <- struct{}{}; return nil }

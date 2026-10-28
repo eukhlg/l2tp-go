@@ -20,6 +20,13 @@ service.RouteIPv4 = routeIPv4
 return service.Serve(ctx)
 ```
 
+For high-rate embedders the data path speaks
+[netio](https://github.com/eukhlg/netio) natively: `server.NewUDPTransport`
+puts the socket on netio's batched receive and sharded owned sender,
+received packets arrive in pooled `packetbuf.Buffer`s (`DataFrame.Buffer`,
+borrowed by `RouteIPv4Owned` until the batch flush), and `OwnedFlowWriter`
+frames return packets in place in the caller's `packetbuf.Buffer`.
+
 The library does not configure host routing or require a TUN device. PPP is part
 of this module. IPsec is provided independently by
 [ipsec-go](https://github.com/eukhlg/ipsec-go); Overture connects the two.

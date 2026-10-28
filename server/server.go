@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/eukhlg/l2tp-go/protocol/l2tp"
+	"github.com/eukhlg/netio/packetbuf"
 )
 
 type DataHandler func(context.Context, DataFrame) error
@@ -21,9 +22,13 @@ type PacketWriter func([]byte) error
 // synchronously to route zero or more return packets to that same PPP session.
 type IPv4Router func(context.Context, DataFrame, PacketWriter) error
 
-// OwnedIPv4Router borrows storage until the driver's batch flush returns.
-// frame.IPv4 starts at offset in storage; the driver retains ownership.
-type OwnedIPv4Router func(context.Context, DataFrame, []byte, int, PacketWriter) error
+// OwnedIPv4Router routes a packet in driver-owned storage. frame.Buffer's view
+// is exactly frame.IPv4, with the buffer's free headroom in front of it. The
+// router may move the view (for example Prepend a header into the headroom)
+// and write into the tailroom if it zeroes what it wrote there; it may keep
+// references until the driver's batch flush returns. The driver keeps
+// ownership: the router never releases the buffer.
+type OwnedIPv4Router func(context.Context, DataFrame, PacketWriter) error
 
 type SessionOpenHandler func(context.Context, SessionInfo, PacketWriter) error
 type SessionCloseHandler func(context.Context, SessionInfo)
@@ -51,10 +56,6 @@ type Server struct {
 	HandleData      DataHandler
 	RouteIPv4       IPv4Router
 	RouteIPv4Owned  OwnedIPv4Router
-	// ReceiveHeadroom reserves bytes before each datagram in Serve's receive
-	// buffers, for owned routers that prepend metadata in place (for example a
-	// TUN virtio header). Zero by default; at most 64.
-	ReceiveHeadroom int
 	// NewRouteBatch creates private state for one receive envelope; Serve
 	// reuses it for every batch that envelope carries. Flush must run
 	// before receive storage is cleared, reused or released, including on errors.
@@ -63,6 +64,25 @@ type Server struct {
 	SessionClosed     SessionCloseHandler
 	RetransmitTimeout time.Duration
 	MaxRetries        int
+	// acquire and release are test seams for receive storage; nil uses
+	// netio's buffer pool.
+	acquire func(int) (*packetbuf.Buffer, error)
+	release func(*packetbuf.Buffer)
+}
+
+func (s *Server) acquireBuffer(size int) (*packetbuf.Buffer, error) {
+	if s.acquire != nil {
+		return s.acquire(size)
+	}
+	return packetbuf.Acquire(size)
+}
+
+func (s *Server) releaseBuffer(buffer *packetbuf.Buffer) {
+	if s.release != nil {
+		s.release(buffer)
+		return
+	}
+	buffer.Release()
 }
 
 // Listen creates an L2TP UDP listener. Standard L2TP uses address ":1701".
@@ -103,15 +123,11 @@ func (s *Server) Serve(ctx context.Context) error {
 			return errors.New("l2tp server: invalid socket batch size")
 		}
 	}
-	headroom := s.ReceiveHeadroom
-	if headroom < 0 || headroom > 64 {
-		return errors.New("l2tp server: receive headroom must be between 0 and 64")
-	}
 	s.plainWrite = s.writeConn
 	if s.ReceivePipeline {
-		return s.servePipeline(ctx, size, headroom, tick, batch, batched)
+		return s.servePipeline(ctx, size, tick, batch, batched)
 	}
-	pool := s.newReadBatchPool(ctx, size, headroom, 1)
+	pool := s.newReadBatchPool(ctx, size, 1)
 	defer pool.close()
 	// Wake a read on cancellation and bound an in-flight/queued socket write.
 	// This watcher never closes the socket before best-effort StopCCN publication.
@@ -179,7 +195,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte) error {
+// processDatagram handles wire, which lies in buffer when buffer is set.
+func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte, buffer *packetbuf.Buffer) error {
 	// Receiving data/ACKs must not wait behind outbound queue backpressure.
 	result, err := s.Engine.HandleDatagramBorrowed(peer, wire, time.Now())
 	if err == nil && len(result.Replies) > 0 {
@@ -208,6 +225,9 @@ func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte
 		return nil
 	}
 	copyBorrowed := false
+	if result.Data != nil && (s.BorrowedReceive || s.RouteIPv4Owned != nil) {
+		result.Data.Buffer = buffer
+	}
 	if !s.BorrowedReceive && result.Data != nil && s.RouteIPv4Owned != nil {
 		// The owned router keeps the borrowed frame; legacy consumers still get
 		// independent copies, made only where they are used.
@@ -311,6 +331,8 @@ func (s *Server) Dispatch(ctx context.Context, result Result, protocol string, w
 
 // DispatchIPv4 lets an embedder frame IPv4 directly into owned storage. The
 // writer receives caller-owned IPv4 and must copy it before retaining it.
+// Setting result.Data.Buffer to the driver-owned storage that holds the frame
+// (borrowed until the driver's batch flush) routes it through RouteIPv4Owned.
 func (s *Server) DispatchIPv4(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
 	return s.dispatchWith(ctx, result, protocol, write, true, false, false)
 }
@@ -388,6 +410,7 @@ func (s *Server) dispatchWith(ctx context.Context, result Result, protocol strin
 			if frame.IPv4 != nil {
 				frame.IPv4 = append([]byte(nil), frame.IPv4...)
 			}
+			frame.Buffer = nil
 			owned = &frame
 		}
 		return *owned
@@ -401,11 +424,11 @@ func (s *Server) dispatchWith(ctx context.Context, result Result, protocol strin
 			return err
 		}
 	}
-	if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4Owned != nil {
+	if result.Data != nil && result.Data.IPv4 != nil && result.Data.Buffer != nil && s.RouteIPv4Owned != nil {
 		frame := *result.Data
-		storage, offset, ok := packetStorage(ctx, frame.IPv4)
-		if ok {
-			return s.RouteIPv4Owned(ctx, frame, storage, offset, newWriter(frame.Peer, frame.TunnelID, frame.Session.LocalID))
+		if ownedView(frame.Buffer, frame.IPv4) {
+			frame.IPv4 = frame.Buffer.Bytes()
+			return s.RouteIPv4Owned(ctx, frame, newWriter(frame.Peer, frame.TunnelID, frame.Session.LocalID))
 		}
 	}
 	if result.Data != nil && result.Data.IPv4 != nil && s.RouteIPv4 != nil {
