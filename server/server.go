@@ -195,10 +195,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// processDatagram handles wire, which lies in buffer when buffer is set.
-func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte, buffer *packetbuf.Buffer) error {
+// processDatagram handles wire, which lies in buffer when buffer is set. frame,
+// when set, is storage for the data frame, reused once dispatch returns.
+func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte, buffer *packetbuf.Buffer, frame *DataFrame) error {
 	// Receiving data/ACKs must not wait behind outbound queue backpressure.
-	result, err := s.Engine.HandleDatagramBorrowed(peer, wire, time.Now())
+	result, err := s.Engine.HandleDatagramInto(peer, wire, time.Now(), frame)
 	if err == nil && len(result.Replies) > 0 {
 		s.sendMu.Lock()
 		for _, reply := range result.Replies {

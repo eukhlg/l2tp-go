@@ -21,6 +21,8 @@ type readBatch struct {
 	// header (for example a TUN virtio header) in front of a packet.
 	heads [][]byte
 	count int
+	// frame is the data frame storage for the packet being processed.
+	frame DataFrame
 	// ctx carries this envelope's route batch; flush writes it. Both are
 	// created once per envelope.
 	ctx   context.Context
@@ -107,6 +109,7 @@ func (p *readBatchPool) recycle(b *readBatch) {
 		restoreView(b.buffers[i], len(b.heads[i]), len(m.Payload))
 	}
 	b.count = 0
+	b.frame = DataFrame{}
 	p.free <- b
 }
 
@@ -166,7 +169,7 @@ func (s *Server) processReadBatch(b *readBatch, count int) error {
 		}
 		m := &b.messages[i]
 		if !m.Truncated && m.N >= 0 && m.N <= len(m.Payload) && m.Peer != nil {
-			if err := s.processDatagram(b.ctx, m.Peer, m.Payload[:m.N:m.N], b.buffers[i]); err != nil {
+			if err := s.processDatagram(b.ctx, m.Peer, m.Payload[:m.N:m.N], b.buffers[i], &b.frame); err != nil {
 				return err
 			}
 		}

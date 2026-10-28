@@ -218,7 +218,7 @@ func TestReceiveDataDoesNotWaitForOutboundSubmission(t *testing.T) {
 	done := make(chan error, 1)
 	s.sendMu.Lock()
 	go func() {
-		done <- s.processDatagram(context.Background(), peer, dataWire(t, ch.PeerTunnelID, sid, 1), nil)
+		done <- s.processDatagram(context.Background(), peer, dataWire(t, ch.PeerTunnelID, sid, 1), nil, nil)
 	}()
 	select {
 	case err := <-done:
@@ -365,7 +365,7 @@ func TestOwnedRouterFallbackKeepsLegacyCopies(t *testing.T) {
 	var routed, handled []byte
 	s.RouteIPv4 = func(_ context.Context, f DataFrame, _ PacketWriter) error { routed = f.IPv4; return nil }
 	s.HandleData = func(_ context.Context, f DataFrame) error { handled = f.PPP.Payload; return nil }
-	if err := s.processDatagram(context.Background(), peer, wire, nil); err != nil {
+	if err := s.processDatagram(context.Background(), peer, wire, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if routed == nil || handled == nil {
@@ -572,5 +572,37 @@ func TestDispatchIPv4RoutesDriverBufferInPlace(t *testing.T) {
 	}
 	if owned != 1 || copied != 1 {
 		t.Fatalf("owned=%d copied=%d", owned, copied)
+	}
+}
+
+// A plain data packet costs no allocation from receive through dispatch to
+// the owned router when tracing is off and the caller supplies frame storage.
+func TestPlainDataPathDoesNotAllocate(t *testing.T) {
+	e, ch, _, sid := dataSession(t)
+	// A socket peer, as received: address conversion and comparison allocate nothing.
+	var peer net.Addr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 9), Port: 1701}
+	e.tunnels[ch.PeerTunnelID].peer = peer
+	s := &Server{Conn: &receiveBatchConn{}, Engine: e, BorrowedReceive: true}
+	s.plainWrite = s.writeConn
+	wire := dataWire(t, ch.PeerTunnelID, sid, 1)
+	buffer := ownedPacket(t, wire)
+	defer buffer.Release()
+	routed := 0
+	s.RouteIPv4Owned = func(context.Context, DataFrame, PacketWriter) error { routed++; return nil }
+	var frame DataFrame
+	ctx := context.Background()
+	process := func() {
+		_, _ = buffer.Prepend(buffer.Headroom())
+		_ = buffer.TrimFront(packetbuf.Headroom)
+		if err := s.processDatagram(ctx, peer, buffer.Bytes(), buffer, &frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	process()
+	if allocs := testing.AllocsPerRun(200, process); allocs != 0 {
+		t.Fatalf("plain data packet allocates %v times", allocs)
+	}
+	if routed != 202 {
+		t.Fatalf("routed=%d", routed)
 	}
 }
