@@ -59,3 +59,22 @@ func TestPlainWriterCachedPerSessionAndForgotten(t *testing.T) {
 		t.Fatal("writer reused for a different peer")
 	}
 }
+
+// Writers of sessions closed outside dispatch are dropped once the cache
+// grows, so it stays bounded by the live sessions.
+func TestSessionWritersOfClosedSessionsAreSwept(t *testing.T) {
+	e, ch, _, sid := dataSession(t)
+	s := &Server{Conn: &receiveBatchConn{}, Engine: e}
+	peer := &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1701}
+	write := func(net.Addr, uint16, uint16, []byte) error { return nil }
+	_ = s.sessionWriter("l2tp/ipsec", write, true, peer, ch.PeerTunnelID, sid)
+	for i := 0; i < 1000; i++ { // unknown sessions: never eligible
+		_ = s.sessionWriter("l2tp/ipsec", write, true, peer, ch.PeerTunnelID, uint16(10000+i))
+	}
+	if len(s.writers) > 130 {
+		t.Fatalf("writers=%d", len(s.writers))
+	}
+	if _, ok := s.writers[writerKey{ch.PeerTunnelID, sid}]; !ok {
+		t.Fatal("live session's writer swept")
+	}
+}

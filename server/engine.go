@@ -87,6 +87,15 @@ type sessionRuntime struct {
 	// either state, and cleared before the session is released, so a reader
 	// holding this runtime never sees a closed or replaced session as open.
 	sendable atomic.Bool
+	// sendableLoad is sendable.Load, bound once so SessionEligibility does
+	// not allocate a method value per call.
+	sendableLoad func() bool
+}
+
+func newSessionRuntime(address netip.Addr) *sessionRuntime {
+	s := &sessionRuntime{address: address}
+	s.sendableLoad = s.sendable.Load
+	return s
 }
 
 type tunnelRuntime struct {
@@ -249,7 +258,7 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 			}
 			pppConfig.ClientAddress = address
 		}
-		sessionRuntime := &sessionRuntime{address: address}
+		sessionRuntime := newSessionRuntime(address)
 		pppConfig.Authorize = func(username string) bool {
 			if e.config.MaxSessionsPerUser > 0 && e.userSessions[username] >= e.config.MaxSessionsPerUser {
 				e.debugf("session rejected tunnel=%d session=%d user=%s reason=per-user-limit current=%d limit=%d", runtime.state.LocalTunnelID, session.LocalID, username, e.userSessions[username], e.config.MaxSessionsPerUser)

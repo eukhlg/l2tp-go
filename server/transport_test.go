@@ -80,7 +80,8 @@ func dataSession(t *testing.T) (*Engine, *l2tp.ControlChannel, testPeer, uint16)
 		t.Fatal(err)
 	}
 	p.Phase = ppp.PhaseOpen
-	session := &sessionRuntime{ppp: p, opened: true, address: netip.MustParseAddr("10.0.0.2")}
+	session := newSessionRuntime(netip.MustParseAddr("10.0.0.2"))
+	session.ppp, session.opened = p, true
 	session.sendable.Store(true) // as the Engine does when PPP reaches Open
 	e.tunnels[ch.PeerTunnelID].sessions[sid] = session
 	return e, ch, peer, sid
@@ -572,6 +573,41 @@ func TestDispatchIPv4RoutesDriverBufferInPlace(t *testing.T) {
 	}
 	if owned != 1 || copied != 1 {
 		t.Fatalf("owned=%d copied=%d", owned, copied)
+	}
+}
+
+// An embedder's IPv4 dispatch reuses one writer per session, and a session's
+// eligibility check is a bound value: neither allocates per packet.
+func TestDispatchIPv4SteadyStateDoesNotAllocate(t *testing.T) {
+	e, ch, _, sid := dataSession(t)
+	// A socket peer, as the ESP bridge passes: comparing it allocates nothing.
+	var peer net.Addr = &net.UDPAddr{IP: net.IPv4(192, 0, 2, 9), Port: 1701}
+	e.tunnels[ch.PeerTunnelID].peer = peer
+	buffer := ownedPacket(t, dataWire(t, ch.PeerTunnelID, sid, 7)[8:])
+	defer buffer.Release()
+	ipv4 := buffer.Bytes()[4:]
+	s := &Server{Conn: &receiveBatchConn{}, Engine: e}
+	routed := 0
+	s.RouteIPv4Owned = func(context.Context, DataFrame, PacketWriter) error { routed++; return nil }
+	write := func(net.Addr, uint16, uint16, []byte) error { return nil }
+	frame := &DataFrame{TunnelID: ch.PeerTunnelID, Session: l2tp.Session{LocalID: sid}, IPv4: ipv4, Peer: peer, Buffer: buffer}
+	ctx := context.Background()
+	// Routing trims the buffer to the IPv4 view, which later packets reuse.
+	dispatch := func() {
+		if err := s.DispatchIPv4(ctx, Result{Data: frame}, "l2tp/ipsec", write); err != nil {
+			t.Fatal(err)
+		}
+		frame.IPv4 = buffer.Bytes()
+	}
+	dispatch()
+	if allocs := testing.AllocsPerRun(100, dispatch); allocs != 0 {
+		t.Fatalf("IPv4 dispatch allocates %v per packet", allocs)
+	}
+	if routed != 102 || len(s.writers) != 1 {
+		t.Fatalf("routed=%d writers=%d", routed, len(s.writers))
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _ = e.SessionEligibility(ch.PeerTunnelID, sid) }); allocs != 0 {
+		t.Fatalf("session eligibility allocates %v", allocs)
 	}
 }
 

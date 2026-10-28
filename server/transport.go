@@ -57,7 +57,7 @@ func (e *Engine) sendEligibility(tunnelID, sessionID uint16) func() bool {
 	if session == nil {
 		return func() bool { return false }
 	}
-	return session.sendable.Load
+	return session.sendableLoad
 }
 
 // SessionFramer frames IPv4 for one established session without taking the
