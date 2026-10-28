@@ -2,7 +2,7 @@ module github.com/eukhlg/l2tp-go
 
 go 1.25
 
-require github.com/eukhlg/netio v0.0.0-20261028152130-584e5b2bd4ea
+require github.com/eukhlg/netio v0.0.0-20261028190308-6560a1c08480
 
 require (
 	golang.org/x/net v0.47.0 // indirect
