@@ -87,6 +87,15 @@ type sessionRuntime struct {
 	// either state, and cleared before the session is released, so a reader
 	// holding this runtime never sees a closed or replaced session as open.
 	sendable atomic.Bool
+	// sendableLoad is sendable.Load, bound once so SessionEligibility does
+	// not allocate a method value per call.
+	sendableLoad func() bool
+}
+
+func newSessionRuntime(address netip.Addr) *sessionRuntime {
+	s := &sessionRuntime{address: address}
+	s.sendableLoad = s.sendable.Load
+	return s
 }
 
 type tunnelRuntime struct {
@@ -140,19 +149,31 @@ func (e *Engine) HandleDatagram(peer net.Addr, wire []byte, now time.Time) (Resu
 // HandleDatagramBorrowed borrows data packet payloads until the final consumer
 // returns. Callers retaining Result asynchronously must copy its data first.
 func (e *Engine) HandleDatagramBorrowed(peer net.Addr, wire []byte, now time.Time) (Result, error) {
+	return e.HandleDatagramInto(peer, wire, now, nil)
+}
+
+// HandleDatagramInto is HandleDatagramBorrowed with caller storage for a data
+// frame: Result.Data, when set, is frame, so a data packet allocates nothing.
+// frame must stay unused by others until the caller is done with Result.
+func (e *Engine) HandleDatagramInto(peer net.Addr, wire []byte, now time.Time, frame *DataFrame) (Result, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.tracef("udp rx peer=%s bytes=%d", peer, len(wire))
+	// Guarded trace calls: boxing their arguments allocates per packet.
+	if e.config.Tracef != nil {
+		e.tracef("udp rx peer=%s bytes=%d", peer, len(wire))
+	}
 	packet, err := l2tp.DecodePacketView(wire)
 	if err != nil {
 		e.debugf("udp drop peer=%s decode_error=%v", peer, err)
 		return Result{}, err
 	}
-	e.tracef("l2tp rx peer=%s control=%t tunnel=%d session=%d ns=%d nr=%d payload_bytes=%d avps=%d", peer, packet.Control, packet.TunnelID, packet.SessionID, packet.Ns, packet.Nr, len(packet.Payload), len(packet.AVPs))
+	if e.config.Tracef != nil {
+		e.tracef("l2tp rx peer=%s control=%t tunnel=%d session=%d ns=%d nr=%d payload_bytes=%d avps=%d", peer, packet.Control, packet.TunnelID, packet.SessionID, packet.Ns, packet.Nr, len(packet.Payload), len(packet.AVPs))
+	}
 	if packet.Control {
 		return e.handleControl(peer, packet, wire, now)
 	}
-	return e.handleData(peer, packet)
+	return e.handleData(peer, packet, frame)
 }
 
 func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, now time.Time) (Result, error) {
@@ -237,7 +258,7 @@ func (e *Engine) handleControl(peer net.Addr, packet l2tp.Packet, wire []byte, n
 			}
 			pppConfig.ClientAddress = address
 		}
-		sessionRuntime := &sessionRuntime{address: address}
+		sessionRuntime := newSessionRuntime(address)
 		pppConfig.Authorize = func(username string) bool {
 			if e.config.MaxSessionsPerUser > 0 && e.userSessions[username] >= e.config.MaxSessionsPerUser {
 				e.debugf("session rejected tunnel=%d session=%d user=%s reason=per-user-limit current=%d limit=%d", runtime.state.LocalTunnelID, session.LocalID, username, e.userSessions[username], e.config.MaxSessionsPerUser)
@@ -368,7 +389,7 @@ func (e *Engine) findControlTunnel(peer net.Addr, packet l2tp.Packet, wire []byt
 	return runtime, true, replaced, nil
 }
 
-func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
+func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet, data *DataFrame) (Result, error) {
 	runtime, ok := e.tunnels[packet.TunnelID]
 	if !ok {
 		return Result{}, ErrUnknownTunnel
@@ -385,14 +406,19 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 		e.debugf("ppp drop peer=%s tunnel=%d session=%d decode_error=%v", peer, packet.TunnelID, packet.SessionID, err)
 		return Result{}, err
 	}
-	data := &DataFrame{TunnelID: packet.TunnelID, Session: session, PPP: frame, Peer: peer}
+	if data == nil {
+		data = new(DataFrame)
+	}
+	*data = DataFrame{TunnelID: packet.TunnelID, Session: session, PPP: frame, Peer: peer}
 	sessionRuntime := runtime.sessions[packet.SessionID]
 	if sessionRuntime == nil || sessionRuntime.ppp == nil {
 		return Result{Data: data}, nil
 	}
 	pppSession := sessionRuntime.ppp
 	phaseBefore := pppSession.Phase
-	e.tracef("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
+	if e.config.Tracef != nil {
+		e.tracef("ppp rx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, frame.Protocol, phaseBefore, len(frame.Payload))
+	}
 	e.debugPPPControl("rx", peer, packet.TunnelID, packet.SessionID, frame)
 	pppResult, err := pppSession.HandleBorrowed(frame)
 	sessionRuntime.sendable.Store(pppSession.Phase == ppp.PhaseOpen) // also after a rejected frame
@@ -421,11 +447,15 @@ func (e *Engine) handleData(peer net.Addr, packet l2tp.Packet) (Result, error) {
 			return Result{}, err
 		}
 		result.Replies = append(result.Replies, wire)
-		e.tracef("ppp tx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, response.Protocol, pppSession.Phase, len(response.Payload))
+		if e.config.Tracef != nil {
+			e.tracef("ppp tx peer=%s tunnel=%d session=%d protocol=%#04x phase=%s bytes=%d", peer, packet.TunnelID, packet.SessionID, response.Protocol, pppSession.Phase, len(response.Payload))
+		}
 		e.debugPPPControl("tx", peer, packet.TunnelID, packet.SessionID, response)
 	}
 	if pppResult.IPv4 != nil {
-		e.tracef("ipv4 routed peer=%s tunnel=%d session=%d bytes=%d", peer, packet.TunnelID, packet.SessionID, len(pppResult.IPv4))
+		if e.config.Tracef != nil {
+			e.tracef("ipv4 routed peer=%s tunnel=%d session=%d bytes=%d", peer, packet.TunnelID, packet.SessionID, len(pppResult.IPv4))
+		}
 		data.IPv4 = pppResult.IPv4
 		result.Data = data
 	}

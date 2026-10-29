@@ -43,6 +43,10 @@ type Server struct {
 	// session opens or closes) instead of building one per data packet.
 	writersMu sync.Mutex
 	writers   map[writerKey]cachedWriter
+	// writersSweep is the cache size at which writers of closed sessions are
+	// dropped: sessions closed outside dispatch (IKE teardown, retransmission
+	// timeout) are never forgotten one by one.
+	writersSweep int
 	// plainWrite is s.writeConn bound once, so dispatch does not allocate a
 	// method value per datagram.
 	plainWrite SessionPacketWriter
@@ -195,10 +199,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
-// processDatagram handles wire, which lies in buffer when buffer is set.
-func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte, buffer *packetbuf.Buffer) error {
+// processDatagram handles wire, which lies in buffer when buffer is set. frame,
+// when set, is storage for the data frame, reused once dispatch returns.
+func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte, buffer *packetbuf.Buffer, frame *DataFrame) error {
 	// Receiving data/ACKs must not wait behind outbound queue backpressure.
-	result, err := s.Engine.HandleDatagramBorrowed(peer, wire, time.Now())
+	result, err := s.Engine.HandleDatagramInto(peer, wire, time.Now(), frame)
 	if err == nil && len(result.Replies) > 0 {
 		s.sendMu.Lock()
 		for _, reply := range result.Replies {
@@ -244,8 +249,11 @@ func (s *Server) processDatagram(ctx context.Context, peer net.Addr, wire []byte
 
 type writerKey struct{ tunnelID, sessionID uint16 }
 type cachedWriter struct {
-	peer   net.Addr
-	writer PacketWriter
+	peer     net.Addr
+	protocol string
+	ipv4     bool
+	writer   PacketWriter
+	live     func() bool // the session's eligibility
 }
 
 func (s *Server) writeConn(peer net.Addr, _, _ uint16, payload []byte) error {
@@ -262,23 +270,41 @@ func (s *Server) dispatchPlain(ctx context.Context, result Result, copyBorrowed 
 	return s.dispatchWith(ctx, result, "l2tp", write, false, copyBorrowed, true)
 }
 
-// plainWriter returns the cached writer for a session, building it on a miss.
+// plainWriter returns the cached writer for a plain session, building it on a miss.
 func (s *Server) plainWriter(peer net.Addr, tunnelID, sessionID uint16) PacketWriter {
+	return s.sessionWriter("l2tp", nil, false, peer, tunnelID, sessionID)
+}
+
+// sessionWriter returns the cached writer for a session, building it from
+// write on a miss. A protocol always passes the same write (Serve's own plain
+// writes, or one embedder writer for DispatchIPv4), so the writer is reused
+// until the session opens anew or closes. A nil write is Serve's plain write.
+func (s *Server) sessionWriter(protocol string, write SessionPacketWriter, ipv4 bool, peer net.Addr, tunnelID, sessionID uint16) PacketWriter {
 	key := writerKey{tunnelID, sessionID}
 	s.writersMu.Lock()
 	defer s.writersMu.Unlock()
-	if c, ok := s.writers[key]; ok && samePeer(c.peer, peer) {
+	if c, ok := s.writers[key]; ok && c.protocol == protocol && c.ipv4 == ipv4 && samePeer(c.peer, peer) {
 		return c.writer
 	}
-	write := s.plainWrite
 	if write == nil {
-		write = s.writeConn
+		write = s.plainWrite
+		if write == nil {
+			write = s.writeConn
+		}
 	}
-	w := s.makeWriter("l2tp", write, false, peer, tunnelID, sessionID)
+	w := s.makeWriter(protocol, write, ipv4, peer, tunnelID, sessionID)
 	if s.writers == nil {
 		s.writers = make(map[writerKey]cachedWriter)
 	}
-	s.writers[key] = cachedWriter{peer, w}
+	if len(s.writers) >= s.writersSweep {
+		for k, c := range s.writers {
+			if !c.live() {
+				delete(s.writers, k)
+			}
+		}
+		s.writersSweep = max(64, 2*len(s.writers))
+	}
+	s.writers[key] = cachedWriter{peer, protocol, ipv4, w, s.Engine.SessionEligibility(tunnelID, sessionID)}
 	return w
 }
 
@@ -333,8 +359,10 @@ func (s *Server) Dispatch(ctx context.Context, result Result, protocol string, w
 // writer receives caller-owned IPv4 and must copy it before retaining it.
 // Setting result.Data.Buffer to the driver-owned storage that holds the frame
 // (borrowed until the driver's batch flush) routes it through RouteIPv4Owned.
+// A session's writer is built from write once and reused while the session
+// lives, so pass the same write for a protocol on every call.
 func (s *Server) DispatchIPv4(ctx context.Context, result Result, protocol string, write SessionPacketWriter) error {
-	return s.dispatchWith(ctx, result, protocol, write, true, false, false)
+	return s.dispatchWith(ctx, result, protocol, write, true, false, true)
 }
 
 // makeWriter builds a session packet writer. For plain L2TP it captures the
@@ -377,7 +405,7 @@ func (s *Server) dispatchWith(ctx context.Context, result Result, protocol strin
 	}
 	newWriter := func(peer net.Addr, tunnelID, sessionID uint16) PacketWriter {
 		if cached {
-			return s.plainWriter(peer, tunnelID, sessionID)
+			return s.sessionWriter(protocol, write, ipv4, peer, tunnelID, sessionID)
 		}
 		return s.makeWriter(protocol, write, ipv4, peer, tunnelID, sessionID)
 	}
